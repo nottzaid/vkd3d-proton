@@ -420,6 +420,41 @@ static HRESULT vkd3d_memory_transfer_queue_flush_locked(struct vkd3d_memory_tran
             case VKD3D_MEMORY_TRANSFER_OP_BUILD_NULL_RTAS:
                 vkd3d_build_null_rtas_va(queue->device, vk_cmd_buffer);
                 break;
+
+            case VKD3D_MEMORY_TRANSFER_OP_COPY_BUFFER:
+            {
+                VkCopyBufferInfo2 copy_info;
+                VkBufferCopy2 region;
+
+                if (transfer->barrier_before)
+                {
+                    dep_info.imageMemoryBarrierCount = 0;
+                    dep_info.memoryBarrierCount = 1;
+                    dep_info.pMemoryBarriers = &vk_barrier;
+
+                    memset(&vk_barrier, 0, sizeof(vk_barrier));
+                    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+                    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    vk_barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    VK_CALL(vkCmdPipelineBarrier2(vk_cmd_buffer, &dep_info));
+                }
+
+                region.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+                region.pNext = NULL;
+                region.srcOffset = transfer->vk_src_offset;
+                region.dstOffset = transfer->vk_buffer_offset;
+                region.size = transfer->vk_buffer_size;
+                copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+                copy_info.pNext = NULL;
+                copy_info.srcBuffer = transfer->vk_src_buffer;
+                copy_info.dstBuffer = transfer->vk_buffer;
+                copy_info.regionCount = 1;
+                copy_info.pRegions = &region;
+                VK_CALL(vkCmdCopyBuffer2(vk_cmd_buffer, &copy_info));
+                break;
+            }
         }
     }
 
@@ -507,6 +542,48 @@ static void vkd3d_memory_transfer_queue_execute_transfer_locked(struct vkd3d_mem
 
     if (queue->num_bytes_pending >= VKD3D_MEMORY_TRANSFER_QUEUE_MAX_PENDING_BYTES)
         vkd3d_memory_transfer_queue_flush_locked(queue);
+}
+
+/* geomirror.c: a buffer copy on the transfer queue. Returns the timeline value that tells when it
+ * has executed. */
+uint64_t vkd3d_memory_transfer_queue_copy_buffer(struct vkd3d_memory_transfer_queue *queue,
+        VkBuffer src, VkDeviceSize src_offset, VkBuffer dst, VkDeviceSize dst_offset, VkDeviceSize size,
+        bool barrier_before)
+{
+    struct vkd3d_memory_transfer_info transfer;
+    uint64_t value;
+
+    memset(&transfer, 0, sizeof(transfer));
+    transfer.op = VKD3D_MEMORY_TRANSFER_OP_COPY_BUFFER;
+    transfer.vk_buffer = dst;
+    transfer.vk_buffer_offset = dst_offset;
+    transfer.vk_buffer_size = size;
+    transfer.vk_src_buffer = src;
+    transfer.vk_src_offset = src_offset;
+    transfer.barrier_before = barrier_before;
+
+    pthread_mutex_lock(&queue->mutex);
+    /* Recorded into the batch the next flush submits with this value (a flush triggered by the
+     * pending-bytes limit inside execute_transfer happens after the insert, so it covers it too). */
+    value = queue->next_signal_value;
+    vkd3d_memory_transfer_queue_execute_transfer_locked(queue, &transfer);
+    pthread_mutex_unlock(&queue->mutex);
+    return value;
+}
+
+bool vkd3d_memory_transfer_queue_is_done(struct vkd3d_memory_transfer_queue *queue, uint64_t value)
+{
+    return vkd3d_memory_transfer_queue_wait_semaphore(queue, value, 0);
+}
+
+void vkd3d_memory_transfer_queue_wait_value(struct vkd3d_memory_transfer_queue *queue, uint64_t value)
+{
+    /* Still in the unsubmitted batch: submit it first, or we would wait forever. */
+    pthread_mutex_lock(&queue->mutex);
+    if (value >= queue->next_signal_value)
+        vkd3d_memory_transfer_queue_flush_locked(queue);
+    pthread_mutex_unlock(&queue->mutex);
+    vkd3d_memory_transfer_queue_wait_semaphore(queue, value, UINT64_MAX);
 }
 
 static void vkd3d_memory_transfer_queue_fill_allocation(struct vkd3d_memory_transfer_queue *queue,
@@ -778,7 +855,7 @@ static HRESULT vkd3d_select_memory_flags(struct d3d12_device *device, const D3D1
                         *type_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
                     break;
                 case D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE:
-                    *type_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                    *type_flags = vkd3d_bench_l0_sysmem(device, heap_properties) ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
                     break;
                 default:
                     return E_INVALIDARG;
@@ -857,6 +934,7 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
         return;
     }
 
+    vkd3d_memtrace_vk_free(allocation->vk_memory_type, allocation->size, allocation->vk_memory);
     VK_CALL(vkFreeMemory(device->vk_device, allocation->vk_memory, NULL));
     rebar_budget = !!(device->memory_info.rebar_budget_mask & (1u << allocation->vk_memory_type));
 
@@ -892,9 +970,63 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
         vkd3d_report_memory_budget(device);
 }
 
+/* miles-bench: VKD3D_BENCH_UPLOAD_BAR_IDX=2,3 lists (1-based, in creation order) the large (>= 32 MiB)
+ * UPLOAD allocations that go to the BAR window (DEVICE_LOCAL | HOST_VISIBLE) instead of system
+ * memory. The engine's constant rings are UPLOAD heaps; the GPU reads constants from them for every
+ * draw and dispatch, over PCIe when they are in system memory. Same bytes, same CPU writes. */
+bool vkd3d_bench_upload_in_bar(VkDeviceSize size)
+{
+    static unsigned int big_uploads;
+    char list[64], *p;
+    unsigned int index;
+
+    if (size < (32ull << 20) || !vkd3d_get_env_var("VKD3D_BENCH_UPLOAD_BAR_IDX", list, sizeof(list)) || !*list)
+        return false;
+    index = __atomic_add_fetch(&big_uploads, 1, __ATOMIC_RELAXED);
+    for (p = list; *p; p++)
+    {
+        if ((p == list || p[-1] == ',') && (unsigned int)atoi(p) == index)
+        {
+            INFO("bench: upload allocation #%u (%"PRIu64" MiB) goes to the BAR window.\n", index, (uint64_t)(size >> 20));
+            return true;
+        }
+    }
+    INFO("bench: upload allocation #%u (%"PRIu64" MiB) stays in system memory.\n", index, (uint64_t)(size >> 20));
+    return false;
+}
+
+/* miles-bench: true if allocating size bytes of pure VRAM from this type would leave less than
+ * vram_reserve of the device-local budget (see vkd3d_bench_vram_reserve). */
+static bool vkd3d_bench_vram_reserve_refuses(struct d3d12_device *device, uint32_t type_index,
+        VkDeviceSize size, VkDeviceSize vram_reserve)
+{
+    const VkMemoryPropertyFlags vram_only = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_info;
+    VkPhysicalDeviceMemoryProperties2 props2;
+    uint32_t heap_index;
+
+    if (!vram_reserve || !device->vk_info.EXT_memory_budget ||
+            (device->memory_properties.memoryTypes[type_index].propertyFlags & vram_only) != VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        return false;
+
+    heap_index = device->memory_properties.memoryTypes[type_index].heapIndex;
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    props2.pNext = &budget_info;
+    budget_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    budget_info.pNext = NULL;
+    VK_CALL(vkGetPhysicalDeviceMemoryProperties2(device->vk_physical_device, &props2));
+
+    if (budget_info.heapUsage[heap_index] + size + vram_reserve <= budget_info.heapBudget[heap_index])
+        return false;
+
+    vkd3d_bench_vram_refused(size);
+    return true;
+}
+
 static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, const uint32_t base_type_mask,
-        void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
+        void *pNext, bool respect_budget, VkDeviceSize vram_reserve, struct vkd3d_device_memory_allocation *allocation)
 {
     const VkPhysicalDeviceMemoryProperties *memory_props = &device->memory_properties;
     uint32_t type_mask, device_local_mask, candidate_mask, heap_index;
@@ -902,6 +1034,7 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
     struct vkd3d_memory_info *memory_info = &device->memory_info;
     VkDeviceSize *type_current, heap_size;
     VkMemoryAllocateInfo allocate_info;
+    uint64_t alloc_t0, alloc_ns;
     bool rebar_budget;
     VkResult vr;
 
@@ -952,7 +1085,7 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
         {
             return vkd3d_try_allocate_device_memory(device, size,
                     type_flags & ~optional_flags,
-                    base_type_mask, pNext, respect_budget, allocation);
+                    base_type_mask, pNext, respect_budget, vram_reserve, allocation);
         }
         else
         {
@@ -1012,6 +1145,9 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
         }
     }
 
+    if (vkd3d_bench_vram_reserve_refuses(device, allocate_info.memoryTypeIndex, size, vram_reserve))
+        return E_OUTOFMEMORY;
+
     /* Not a hard limit, but may fail at a driver level */
     if (allocate_info.allocationSize > device->device_info.vulkan_1_1_properties.maxMemoryAllocationSize)
     {
@@ -1022,7 +1158,15 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
     /* In case we get address binding callbacks, ensure driver knows it's not a sparse bind that happens async. */
     vkd3d_address_binding_tracker_mark_user_thread();
 
+    alloc_t0 = vkd3d_get_current_time_ns();
     vr = VK_CALL(vkAllocateMemory(device->vk_device, &allocate_info, NULL, &allocation->vk_memory));
+    alloc_ns = vkd3d_get_current_time_ns() - alloc_t0;
+    /* miles-bench: slow or failed driver allocations, on the frame trace's clock. */
+    if (vr != VK_SUCCESS || alloc_ns > 2000000)
+        vkd3d_frametrace_event("vkAllocateMemory %s %.3f ms %"PRIu64" KiB type %u flags %#x", vr == VK_SUCCESS ? "ok" : "fail",
+                alloc_ns / 1e6, (uint64_t)allocate_info.allocationSize >> 10, allocate_info.memoryTypeIndex, type_flags);
+    vkd3d_memtrace_vk_allocate(device, allocate_info.memoryTypeIndex, allocate_info.allocationSize,
+            vr == VK_SUCCESS, respect_budget, vr == VK_SUCCESS ? allocation->vk_memory : VK_NULL_HANDLE);
 
     if (vr == VK_SUCCESS)
     {
@@ -1094,15 +1238,15 @@ static bool vkd3d_memory_info_type_mask_covers_multiple_memory_heaps(
     return !!(heap_mask & (heap_mask - 1u));
 }
 
-HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
+static HRESULT vkd3d_allocate_device_memory_reserve(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
-        void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
+        void *pNext, bool respect_budget, VkDeviceSize vram_reserve, struct vkd3d_device_memory_allocation *allocation)
 {
     const VkMemoryPropertyFlags optional_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     HRESULT hr;
 
     hr = vkd3d_try_allocate_device_memory(device, size, type_flags,
-            type_mask, pNext, respect_budget, allocation);
+            type_mask, pNext, respect_budget, vram_reserve, allocation);
 
     if (FAILED(hr) && (type_flags & optional_flags))
     {
@@ -1115,7 +1259,7 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
             {
                 WARN("Memory allocation failed, falling back to system memory.\n");
                 hr = vkd3d_try_allocate_device_memory(device, size,
-                        type_flags & ~optional_flags, type_mask, pNext, respect_budget, allocation);
+                        type_flags & ~optional_flags, type_mask, pNext, respect_budget, 0, allocation);
             }
             else if (!device->memory_info.fallback_domain.rt_ds_type_mask ||
                     !device->memory_info.fallback_domain.sampled_type_mask ||
@@ -1144,6 +1288,14 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
     return hr;
 }
 
+HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
+        VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
+        void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
+{
+    return vkd3d_allocate_device_memory_reserve(device, size, type_flags, type_mask,
+            pNext, respect_budget, 0, allocation);
+}
+
 static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_address,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
         void *pNext, struct vkd3d_device_memory_allocation *allocation)
@@ -1158,7 +1310,7 @@ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_
 
     if (VKD3D_CONFIG_FLAG_IS_SET(USE_HOST_IMPORT_FALLBACK) ||
         FAILED(hr = vkd3d_try_allocate_device_memory(device, size,
-            type_flags, type_mask, &import_info, true, allocation)))
+            type_flags, type_mask, &import_info, true, 0, allocation)))
     {
         if (FAILED(hr))
             WARN("Failed to import host memory, hr %#x.\n", (int)hr);
@@ -1167,7 +1319,7 @@ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_
          * so it's fine. */
         hr = vkd3d_try_allocate_device_memory(device, size,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                type_mask, pNext, true, allocation);
+                type_mask, pNext, true, 0, allocation);
     }
 
     return hr;
@@ -1270,6 +1422,8 @@ static void vkd3d_memory_allocation_free(const struct vkd3d_memory_allocation *a
 
     if (allocation->flags & VKD3D_ALLOCATION_FLAG_ALLOW_WRITE_WATCH)
         vkd3d_free_write_watch_pointer(allocation->cpu_address);
+    if (allocation->cpu_address)
+        vkd3d_bench_pinned_remove(allocation->cpu_address);
 
     if ((allocation->flags & VKD3D_ALLOCATION_FLAG_GPU_ADDRESS) && allocation->resource.va &&
             !(allocation->flags & VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH))
@@ -1340,6 +1494,10 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
      * since the info->memory_requirements already encodes
      * only HOST_VISIBLE types and we use NO_FALLBACK allocation mode. */
     type_flags &= ~info->optional_memory_properties;
+
+    if (allocation->heap_type == D3D12_HEAP_TYPE_UPLOAD && !host_ptr &&
+            vkd3d_bench_upload_in_bar(info->memory_requirements.size))
+        type_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
     if (allocation->flags & VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER)
     {
@@ -1471,12 +1629,16 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     else if (info->flags & VKD3D_ALLOCATION_FLAG_NO_FALLBACK)
     {
         hr = vkd3d_try_allocate_device_memory(device, memory_requirements.size, type_flags,
-                type_mask, &flags_info, true, &allocation->device_allocation);
+                type_mask, &flags_info, true,
+                vkd3d_bench_vram_reserve(&info->heap_properties, info->heap_flags, info->flags),
+                &allocation->device_allocation);
     }
     else
     {
-        hr = vkd3d_allocate_device_memory(device, memory_requirements.size, type_flags,
-                type_mask, &flags_info, allocation->heap_type == D3D12_HEAP_TYPE_UPLOAD, &allocation->device_allocation);
+        hr = vkd3d_allocate_device_memory_reserve(device, memory_requirements.size, type_flags,
+                type_mask, &flags_info, allocation->heap_type == D3D12_HEAP_TYPE_UPLOAD,
+                vkd3d_bench_vram_reserve(&info->heap_properties, info->heap_flags, info->flags),
+                &allocation->device_allocation);
     }
 
     if (FAILED(hr))
@@ -1514,6 +1676,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
             vkd3d_memory_allocation_free(allocation, device, allocator);
             return hresult_from_vk_result(vr);
         }
+        vkd3d_bench_pinned_add(allocation->cpu_address, allocation->device_allocation.size);
     }
 
     /* Bind memory to global or dedicated buffer as needed */
@@ -1842,7 +2005,7 @@ static HRESULT vkd3d_memory_allocator_try_add_chunk(struct vkd3d_memory_allocato
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, uint32_t type_mask,
         VkMemoryPropertyFlags optional_properties,
         VkBufferUsageFlags2KHR explicit_global_buffer_usage,
-        VkDeviceSize minimum_size,
+        VkDeviceSize minimum_size, uint32_t bench_flags,
         struct vkd3d_memory_chunk **chunk)
 {
     struct vkd3d_allocate_memory_info alloc_info;
@@ -1855,7 +2018,7 @@ static HRESULT vkd3d_memory_allocator_try_add_chunk(struct vkd3d_memory_allocato
     alloc_info.heap_properties = *heap_properties;
     /* sub-allocations are always explicitly cleared if needed on the outside. */
     alloc_info.heap_flags = heap_flags | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
-    alloc_info.flags = VKD3D_ALLOCATION_FLAG_NO_FALLBACK;
+    alloc_info.flags = VKD3D_ALLOCATION_FLAG_NO_FALLBACK | bench_flags;
     alloc_info.optional_memory_properties = optional_properties;
     alloc_info.vk_memory_priority = vkd3d_convert_to_vk_prio(D3D12_RESIDENCY_PRIORITY_NORMAL);
     alloc_info.explicit_global_buffer_usage = 0;
@@ -1892,7 +2055,7 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
         struct d3d12_device *device, const VkMemoryRequirements *memory_requirements, uint32_t type_mask,
         VkMemoryPropertyFlags optional_properties,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
-        VkBufferUsageFlags2KHR explicit_global_buffer_usage,
+        VkBufferUsageFlags2KHR explicit_global_buffer_usage, uint32_t bench_flags,
         struct vkd3d_memory_allocation *allocation)
 {
     const D3D12_HEAP_FLAGS heap_flag_mask = ~(D3D12_HEAP_FLAG_CREATE_NOT_ZEROED |
@@ -1902,6 +2065,8 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
 
     D3D12_HEAP_TYPE normalized_heap_type;
     struct vkd3d_memory_chunk *chunk;
+    VkDeviceSize vram_reserve;
+    bool vram_tight = false;
     HRESULT hr;
     size_t i;
 
@@ -1909,9 +2074,30 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
     type_mask &= memory_requirements->memoryTypeBits;
     normalized_heap_type = vkd3d_normalize_heap_type(heap_properties);
 
+    /* miles-bench: chunks are shared by hot and cold heaps, so free space in a VRAM chunk is VRAM
+     * that render targets created later may need. Cold sub-allocations (e.g. the game's small
+     * texture heaps) skip VRAM chunks once VRAM is within the reserve of the budget, the same
+     * rule new chunks and dedicated allocations follow. Opt-in (VKD3D_BENCH_VRAM_RESERVE_CHUNKS=1):
+     * with the kept VRAM reserve alone it sends more small textures to system memory and costs fps. */
+    if (vkd3d_bench_vram_reserve_chunks() && (vram_reserve = vkd3d_bench_vram_reserve(heap_properties, heap_flags, bench_flags)))
+    {
+        for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
+        {
+            if ((type_mask & (1u << i)) && vkd3d_bench_vram_reserve_refuses(device, i, memory_requirements->size, vram_reserve))
+            {
+                vram_tight = true;
+                break;
+            }
+        }
+    }
+
     for (i = 0; i < allocator->chunks_count; i++)
     {
         chunk = allocator->chunks[i];
+
+        if (vram_tight && (device->memory_properties.memoryTypes[chunk->allocation.device_allocation.vk_memory_type].propertyFlags &
+                (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            continue;
 
         /* Match heap type so that we know we get the appropriate memory property flags.
          * These types are normalized, so that different CUSTOM heaps will be considered to be different heap types.
@@ -1933,7 +2119,7 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
      * before the caller falls back to potentially slower memory */
     if (FAILED(hr = vkd3d_memory_allocator_try_add_chunk(allocator, device, heap_properties,
             heap_flags, type_mask, optional_properties,
-            explicit_global_buffer_usage, memory_requirements->size, &chunk)))
+            explicit_global_buffer_usage, memory_requirements->size, bench_flags, &chunk)))
         return hr;
 
     return vkd3d_memory_chunk_allocate_range(chunk, memory_requirements, allocation);
@@ -1981,7 +2167,8 @@ static HRESULT vkd3d_suballocate_memory(struct d3d12_device *device, struct vkd3
 
     hr = vkd3d_memory_allocator_try_suballocate_memory(allocator, device,
             &memory_requirements, optional_mask, 0, &info->heap_properties,
-            info->heap_flags, info->explicit_global_buffer_usage, allocation);
+            info->heap_flags, info->explicit_global_buffer_usage, info->flags & VKD3D_ALLOCATION_FLAGS_BENCH,
+            allocation);
 
     if (FAILED(hr) && (required_mask & ~optional_mask))
     {
@@ -1989,7 +2176,7 @@ static HRESULT vkd3d_suballocate_memory(struct d3d12_device *device, struct vkd3
                 &memory_requirements, required_mask & ~optional_mask,
                 optional_flags,
                 &info->heap_properties, info->heap_flags, info->explicit_global_buffer_usage,
-                allocation);
+                info->flags & VKD3D_ALLOCATION_FLAGS_BENCH, allocation);
     }
 
     pthread_mutex_unlock(&allocator->mutex);

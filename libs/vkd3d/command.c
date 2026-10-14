@@ -1586,6 +1586,8 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface 
     }
     completed_value = fence->virtual_value;
     pthread_mutex_unlock(&fence->mutex);
+    if (vkd3d_engine_spin_patched)
+        vkd3d_engine_note_fence_poll(fence, completed_value);
     return completed_value;
 }
 
@@ -3006,6 +3008,9 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
 
         d3d12_command_allocator_free_command_pool(&allocator->primary_pool, device);
         d3d12_command_allocator_free_command_pool(&allocator->fallback_pool, device);
+        if (allocator->particle_pool)
+            VK_CALL(vkDestroyCommandPool(device->vk_device, allocator->particle_pool, NULL));
+        vkd3d_free(allocator->particle_cbs);
 
         for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
         {
@@ -3154,6 +3159,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
         return hr;
     if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->fallback_pool)))
         return hr;
+    if (allocator->particle_pool)
+    {
+        device->vk_procs.vkResetCommandPool(device->vk_device, allocator->particle_pool, 0);
+        allocator->particle_cb_used = 0;
+    }
 
     /* Return scratch buffers to the device */
     for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
@@ -4765,6 +4775,13 @@ static void d3d12_command_list_discard_attachment_barrier(struct d3d12_command_l
             (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
     {
         d3d12_command_list_discard_attachment(list, resource, subresources);
+
+        /* miles-bench: a discarded render target is in RENDER_TARGET state, so it already has the
+         * attachment layout; the UNDEFINED -> layout barrier only lets the driver drop its
+         * contents (NVIDIA spends ~9 us per image on it). Keeping the contents is a valid
+         * "undefined" result. */
+        if (vkd3d_bench_features() & VKD3D_BENCH_FEATURE_DISCARD_KEEP)
+            return;
 
         stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
@@ -6975,6 +6992,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
 
     TRACE("iface %p.\n", iface);
 
+    list->particle.index = 0;
+
     if (!list->is_recording)
     {
         WARN("Command list is not in the recording state.\n");
@@ -7246,6 +7265,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
     d3d12_command_list_iface *iface = &list->ID3D12GraphicsCommandList_iface;
 
     list->index_buffer.dxgi_format = DXGI_FORMAT_UNKNOWN;
+    memset(&list->frametrace, 0, sizeof(list->frametrace));
 
     list->is_inside_render_pass = false;
     list->render_pass_flags = 0;
@@ -7268,6 +7288,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
 
     list->index_buffer.buffer = VK_NULL_HANDLE;
     list->index_buffer.is_dirty = true;
+    list->index_buffer_cacheable = false;
 
     list->current_pipeline = VK_NULL_HANDLE;
     list->command_buffer_pipeline = VK_NULL_HANDLE;
@@ -7327,6 +7348,9 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
 #endif
 
     list->has_replaced_shaders = false;
+    list->pdraw.redirect_count = list->pdraw.check_count = 0;
+    list->bench_borrowed_bound_count = 0;
+    list->bench_borrowed_tables = false;
 
     list->init_transitions_count = 0;
     list->query_ranges.count = 0;
@@ -9243,6 +9267,93 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
     return true;
 }
 
+static void d3d12_command_list_pdraw_draw(struct d3d12_command_list *list);
+static void d3d12_command_list_pdraw_restore(struct d3d12_command_list *list);
+static uint64_t vkd3d_pdraw_stat_guard[128];
+static void d3d12_command_list_pdraw_check_va(struct d3d12_command_list *list, VkDeviceAddress va, VkDeviceSize size);
+static void d3d12_command_list_pdraw_flush(struct d3d12_command_list *list);
+static bool d3d12_command_list_pdraw_barrier(struct d3d12_command_list *list,
+        UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers);
+static bool d3d12_command_list_pdraw_copy(struct d3d12_command_list *list, struct d3d12_resource *dst,
+        uint64_t dst_offset, struct d3d12_resource *src, uint64_t src_offset, uint64_t size);
+static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_list_iface *iface,
+        UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers);
+static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_list_iface *iface,
+        ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 byte_count);
+
+/* miles-bench, feature bit 0x200: the engine's particle draws each follow a 3840-byte
+ * CopyBufferRegion from the upload heap. Logs that copy and the descriptor tables (CBV/SRV
+ * entries: va+range/format) of the draw after it, for the next 400 such draws. */
+static VkDeviceAddress vkd3d_draw_diag_copy_dst, vkd3d_draw_diag_copy_src;
+static void d3d12_command_list_draw_diag(struct d3d12_command_list *list, const char *what)
+{
+    const struct d3d12_root_signature *rs = list->graphics_bindings.root_signature;
+    const struct vkd3d_descriptor_metadata_view *views = list->cbv_srv_uav_descriptors_view;
+    const struct vkd3d_shader_resource_binding *bind;
+    static int limit, armed;
+    unsigned int p, b, k, idx, base, count;
+    char line[4096];
+    size_t n;
+
+    if (!(vkd3d_bench_features() & VKD3D_BENCH_FEATURE_DRAW_DIAG))
+    {
+        armed = 0;
+        return;
+    }
+    if (!armed)
+    {
+        armed = 1;
+        limit = 400;
+    }
+    if (limit <= 0 || !vkd3d_draw_diag_copy_dst || !rs || !views)
+        return;
+    limit--;
+    n = snprintf(line, sizeof(line), "ddiag %s after copy %"PRIx64" <- %"PRIx64" pso %p rs %p:", what,
+            (uint64_t)vkd3d_draw_diag_copy_dst, (uint64_t)vkd3d_draw_diag_copy_src,
+            (void *)list->state, (void *)rs);
+    vkd3d_draw_diag_copy_dst = 0;
+    if (list->state && !d3d12_pipeline_state_is_compute(list->state))
+    {
+        for (k = 0; k < list->state->graphics.stage_count; k++)
+            n += snprintf(line + n, sizeof(line) - n, " stage%#x=%016"PRIx64,
+                    list->state->graphics.stages[k].stage, list->state->graphics.code[k].meta.hash);
+    }
+    for (p = 0; p < rs->parameter_count && n < sizeof(line) - 160; p++)
+    {
+        if (rs->parameters[p].parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        {
+            n += snprintf(line + n, sizeof(line) - n, " [p%u type %u]", p, rs->parameters[p].parameter_type);
+            continue;
+        }
+        base = list->graphics_bindings.descriptor_tables[p];
+        n += snprintf(line + n, sizeof(line) - n, " [p%u base %u {", p, base);
+        for (b = 0; b < rs->parameters[p].descriptor_table.binding_count && n < sizeof(line) - 160; b++)
+        {
+            bind = &rs->parameters[p].descriptor_table.first_binding[b];
+            n += snprintf(line + n, sizeof(line) - n, " type%u reg%u+%u off%u", bind->type, bind->register_index,
+                    bind->register_count, bind->descriptor_offset);
+        }
+        n += snprintf(line + n, sizeof(line) - n, " }");
+        for (b = 0; b < rs->parameters[p].descriptor_table.binding_count && n < sizeof(line) - 160; b++)
+        {
+            bind = &rs->parameters[p].descriptor_table.first_binding[b];
+            if (bind->type != VKD3D_SHADER_DESCRIPTOR_TYPE_SRV && bind->type != VKD3D_SHADER_DESCRIPTOR_TYPE_CBV)
+                continue;
+            count = min(bind->register_count, 12u);
+            for (k = 0; k < count && n < sizeof(line) - 160; k++)
+            {
+                idx = base + bind->descriptor_offset + k;
+                n += snprintf(line + n, sizeof(line) - n, " %c%u@%u=%"PRIx64"+%x/f%u",
+                        bind->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SRV ? 't' : 'b', bind->register_index + k, idx,
+                        (uint64_t)views[idx].info.buffer.va, views[idx].info.buffer.range,
+                        views[idx].info.buffer.dxgi_format);
+            }
+        }
+        n += snprintf(line + n, sizeof(line) - n, "]");
+    }
+    INFO("%s\n", line);
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_list_iface *iface,
         UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location,
         UINT start_instance_location)
@@ -9255,6 +9366,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
             "start_vertex_location %u, start_instance_location %u.\n",
             iface, vertex_count_per_instance, instance_count,
             start_vertex_location, start_instance_location);
+
+    vkd3d_frametrace_count_draw(list);
+    d3d12_command_list_draw_diag(list, "draw");
+    d3d12_command_list_pdraw_restore(list);
+    d3d12_command_list_pdraw_draw(list);
 
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -9325,9 +9441,37 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
             iface, index_count_per_instance, instance_count, start_vertex_location,
             base_vertex_location, start_instance_location);
 
+    vkd3d_frametrace_count_draw(list);
+    d3d12_command_list_draw_diag(list, "drawindexed");
+    d3d12_command_list_pdraw_restore(list);
+    d3d12_command_list_pdraw_draw(list);
+    vkd3d_frametrace_draw_indexed(list, index_count_per_instance, start_vertex_location, base_vertex_location);
+
     d3d12_command_list_flush_dgc_batch(list);
 
-    if (!d3d12_command_list_update_index_buffer(list))
+    /* idxcache.c: indices from the system-memory geometry heap are read from a VRAM copy. */
+    if (list->index_buffer_cacheable && !list->predication.fallback_enabled &&
+            !(vkd3d_bench_features() & VKD3D_BENCH_FEATURE_IDXC_OFF))
+    {
+        VkDeviceSize index_size = list->index_buffer.vk_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+        VkDeviceSize start = (VkDeviceSize)start_vertex_location * index_size;
+        VkDeviceSize size = (VkDeviceSize)index_count_per_instance * index_size;
+        VkDeviceSize cache_offset;
+        VkBuffer cache_buffer;
+
+        if (start + size <= list->index_buffer.size &&
+                vkd3d_index_cache_lookup(list->index_buffer.buffer, list->index_buffer.offset + start, size,
+                        &cache_buffer, &cache_offset))
+        {
+            VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, cache_buffer, cache_offset, size,
+                    list->index_buffer.vk_type));
+            list->index_buffer.is_dirty = true; /* the next draw binds the game's buffer again */
+            start_vertex_location = 0;
+        }
+        else if (!d3d12_command_list_update_index_buffer(list))
+            return;
+    }
+    else if (!d3d12_command_list_update_index_buffer(list))
         return;
 
     if (list->predication.fallback_enabled)
@@ -9485,6 +9629,1480 @@ static void d3d12_command_list_check_compute_barrier(struct d3d12_command_list *
             list->device, list->cmd.vk_command_buffer);
 }
 
+/* miles-bench: particle loop batching (VKD3D_BENCH_PARTICLE_BATCH=K, K systems per batch).
+ *
+ * The engine simulates its GPU particle systems one after another (MilesMorales.exe 0x1edfa80):
+ * per system 3-8 small compute steps (simulate, spawn, build dispatch args, sort, prepare draw)
+ * and a 96-byte copy of the draw args, each behind a global UAV barrier, ~60 systems a frame.
+ * Every barrier drains the GPU, so the loop is ~2-3 ms of a mostly idle GPU per frame.
+ *
+ * Here the steps of up to K consecutive systems are recorded into per-phase secondary command
+ * buffers (step j of each system into phase j) and spliced back into the list as phase 0,
+ * barrier, phase 1, barrier, ...: every system's steps keep their order with a full barrier
+ * between consecutive steps, and steps of different systems in one phase run side by side. That
+ * is only exact if systems in one batch share no written memory (see the scratch renaming). Any
+ * other call on the list closes the batch first (the list's vtable is a guard while a batch is
+ * open), so nothing else moves across a batch. Live switch: feature bit 0x40 turns it off. */
+#define VKD3D_PARTICLE_MAX_COPIES 32
+static int vkd3d_particle_batch_k = -1;
+static uint64_t vkd3d_particle_stat_batches, vkd3d_particle_stat_systems, vkd3d_particle_stat_phases;
+
+static unsigned int vkd3d_particle_batch_size(void)
+{
+    char env[16];
+
+    uint32_t features = vkd3d_bench_features(), k;
+
+    if (vkd3d_particle_batch_k < 0)
+        vkd3d_particle_batch_k = vkd3d_get_env_var("VKD3D_BENCH_PARTICLE_BATCH", env, sizeof(env)) ?
+                min(atoi(env), VKD3D_PARTICLE_MAX_COPIES) : 0;
+    if (vkd3d_particle_batch_k <= 1 || (features & VKD3D_BENCH_FEATURE_PARTICLE_BATCH_OFF))
+        return 0;
+    /* Live override of the batch size: feature bits 24-29 (bench A/B), at most the configured size. */
+    k = (features >> 24) & 0x3f;
+    return k > 1 ? min(k, (uint32_t)vkd3d_particle_batch_k) : (uint32_t)vkd3d_particle_batch_k;
+}
+
+#define VKD3D_PARTICLE_SIMULATE 0x662c25e757553f79ull
+
+static bool vkd3d_particle_shader(uint64_t hash)
+{
+    static const uint64_t hashes[] =
+    {
+        VKD3D_PARTICLE_SIMULATE,
+        0xf560236567e1f82dull, /* spawn */
+        0xe3b454ffb034d091ull, /* dispatch/draw args from the live count */
+        0x181b4e975cc87a56ull, 0xe11b26be234a8b05ull, 0x42042f6cfbcbc60cull, /* sort */
+        0x84bec3df6e178db7ull, 0xb15604df3ab336acull, /* prepare draw */
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(hashes); i++)
+        if (hashes[i] == hash)
+            return true;
+    return false;
+}
+
+/* Scratch renaming. Every system writes the same two scratch buffers (G658/G670 in the engine:
+ * 2 MiB R32G32B32A32_UINT, 1 MiB R32G32_UINT), so systems that share a phase need their own
+ * copies: system i of a batch (i >= 1) gets copy i. The particle shaders only read their
+ * descriptors at fixed offsets from their table bases (no dynamic indexing; listed below from
+ * the shaders' SPIR-V), and the engine copies fresh tables for every system into a ring in the
+ * shader-visible heap, so only those entries are rewritten, right before the dispatch. An entry
+ * already claimed by another system of the same batch would mean a shared table: batching is
+ * then switched off for good. */
+static unsigned int vkd3d_particle_sims; /* simulate dispatches seen (renaming-time system ids) */
+#define VKD3D_PARTICLE_MAX_OWNED 512
+
+struct vkd3d_particle_access
+{
+    uint64_t hash;
+    uint8_t count;
+    struct { uint8_t table, offset, uav; } e[12];
+};
+
+static const struct vkd3d_particle_access vkd3d_particle_accesses[] =
+{
+    {0x662c25e757553f79ull, 12, {{0,0,0}, {0,5,0}, {0,6,0}, {0,10,0}, {0,11,0}, {0,12,0}, {0,13,0},
+            {0,56,0}, {0,57,0}, {0,76,0}, {2,1,1}, {2,2,1}}},
+    {0xf560236567e1f82dull, 4, {{0,2,0}, {0,5,0}, {2,1,1}, {2,2,1}}},
+    {0xe3b454ffb034d091ull, 1, {{2,0,1}}},
+    {0x181b4e975cc87a56ull, 2, {{2,0,1}, {2,2,1}}},
+    {0xe11b26be234a8b05ull, 2, {{2,0,1}, {2,2,1}}},
+    {0x42042f6cfbcbc60cull, 2, {{2,0,1}, {2,2,1}}},
+    {0x84bec3df6e178db7ull, 4, {{0,7,0}, {0,8,0}, {2,0,1}, {2,1,1}}},
+    {0xb15604df3ab336acull, 3, {{0,7,0}, {2,0,1}, {2,1,1}}},
+};
+
+static struct vkd3d_particle_scratch
+{
+    VkDeviceAddress va;
+    uint32_t range;
+    struct d3d12_resource *copies[VKD3D_PARTICLE_MAX_COPIES]; /* [0] unused: system 0 keeps the original */
+} vkd3d_particle_scratch[4];
+static unsigned int vkd3d_particle_scratch_count;
+static pthread_mutex_t vkd3d_particle_scratch_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Which scratch buffer (and copy) a descriptor's VA range belongs to. */
+static struct vkd3d_particle_scratch *vkd3d_particle_scratch_find(VkDeviceAddress va, uint32_t range)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < vkd3d_particle_scratch_count; i++)
+    {
+        if (vkd3d_particle_scratch[i].range != range)
+            continue;
+        if (vkd3d_particle_scratch[i].va == va)
+            return &vkd3d_particle_scratch[i];
+        for (j = 1; j < VKD3D_PARTICLE_MAX_COPIES; j++)
+            if (vkd3d_particle_scratch[i].copies[j] && vkd3d_particle_scratch[i].copies[j]->res.va == va)
+                return &vkd3d_particle_scratch[i];
+    }
+    return NULL;
+}
+
+/* A simulate step's UAV 1/2: scratch once two different systems have been seen binding it. */
+static void vkd3d_particle_scratch_learn(VkDeviceAddress va, uint32_t range, unsigned int sim)
+{
+    static struct { VkDeviceAddress va; uint32_t range; unsigned int sim; } candidates[8];
+    unsigned int i;
+
+    if (!va || !range)
+        return;
+    pthread_mutex_lock(&vkd3d_particle_scratch_lock);
+    if (!vkd3d_particle_scratch_find(va, range))
+    {
+        for (i = 0; i < ARRAY_SIZE(candidates); i++)
+        {
+            if (candidates[i].va == va && candidates[i].range == range)
+                break;
+        }
+        if (i == ARRAY_SIZE(candidates))
+        {
+            for (i = 0; i < ARRAY_SIZE(candidates) && candidates[i].va; i++)
+                ;
+            if (i < ARRAY_SIZE(candidates))
+            {
+                candidates[i].va = va;
+                candidates[i].range = range;
+                candidates[i].sim = sim;
+            }
+        }
+        else if (candidates[i].sim != sim && vkd3d_particle_scratch_count < ARRAY_SIZE(vkd3d_particle_scratch))
+        {
+            vkd3d_particle_scratch[vkd3d_particle_scratch_count].va = va;
+            vkd3d_particle_scratch[vkd3d_particle_scratch_count].range = range;
+            vkd3d_particle_scratch_count++;
+            INFO("particle batching: scratch buffer va %#"PRIx64", %u bytes.\n", (uint64_t)va, range);
+        }
+    }
+    pthread_mutex_unlock(&vkd3d_particle_scratch_lock);
+}
+
+static struct d3d12_resource *vkd3d_particle_scratch_copy(struct d3d12_device *device,
+        struct vkd3d_particle_scratch *scratch, unsigned int index)
+{
+    D3D12_HEAP_PROPERTIES heap_properties;
+    struct d3d12_resource *copy = NULL;
+    D3D12_RESOURCE_DESC1 desc;
+
+    pthread_mutex_lock(&vkd3d_particle_scratch_lock);
+    if (!(copy = scratch->copies[index]))
+    {
+        memset(&desc, 0, sizeof(desc));
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = scratch->range;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        memset(&heap_properties, 0, sizeof(heap_properties));
+        heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(d3d12_resource_create_committed(device, &desc, &heap_properties, D3D12_HEAP_FLAG_NONE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, 0, NULL, NULL, &copy)))
+        {
+            ERR("particle batching: failed to create scratch copy %u.\n", index);
+            copy = NULL;
+        }
+        scratch->copies[index] = copy;
+    }
+    pthread_mutex_unlock(&vkd3d_particle_scratch_lock);
+    return copy;
+}
+
+/* Rewrites the scratch entries the current dispatch reads to system `index`'s buffers. Returns
+ * false if that is not possible (batching must stop). */
+static bool d3d12_command_list_particle_rename(struct d3d12_command_list *list, uint64_t hash, unsigned int index)
+{
+    const struct d3d12_root_signature *rs = list->compute_bindings.root_signature;
+    const struct vkd3d_descriptor_metadata_view *views = list->cbv_srv_uav_descriptors_view;
+    struct d3d12_descriptor_heap *heap = list->descriptor_heap.buffers.resource.heap;
+    struct vkd3d_particle_batch *b = &list->particle;
+    const struct vkd3d_particle_access *access = NULL;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    struct vkd3d_particle_scratch *scratch;
+    const struct vkd3d_format *format;
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    struct d3d12_resource *target;
+    unsigned int i, p, base, idx, o;
+    VkDeviceAddress want_va;
+
+    for (i = 0; i < ARRAY_SIZE(vkd3d_particle_accesses); i++)
+        if (vkd3d_particle_accesses[i].hash == hash)
+            access = &vkd3d_particle_accesses[i];
+    if (!access || !rs || !views || !heap)
+        return false;
+
+    for (i = 0; i < access->count; i++)
+    {
+        for (p = 0; p < rs->parameter_count; p++)
+        {
+            if (rs->parameters[p].parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                    rs->parameters[p].descriptor_table.table_index == access->e[i].table)
+                break;
+        }
+        if (p == rs->parameter_count)
+            return false;
+        base = list->compute_bindings.descriptor_tables[p];
+        idx = base + access->e[i].offset;
+        if (idx >= heap->desc.NumDescriptors)
+            return false;
+        if (!(views[idx].info.flags & VKD3D_DESCRIPTOR_FLAG_BUFFER_VA_RANGE))
+            continue;
+
+        /* The simulate step's UAVs 1 and 2 are the scratch buffers (engine G658/G670). */
+        if (hash == VKD3D_PARTICLE_SIMULATE && access->e[i].uav && access->e[i].offset)
+            vkd3d_particle_scratch_learn(views[idx].info.buffer.va, views[idx].info.buffer.range, vkd3d_particle_sims);
+        if (!(scratch = vkd3d_particle_scratch_find(views[idx].info.buffer.va, views[idx].info.buffer.range)))
+            continue;
+
+        /* Claim the entry for this system; another system of this batch reading it = shared table. */
+        for (o = 0; o < b->owned_count; o++)
+        {
+            if (b->owned[o].index == idx)
+            {
+                if (b->owned[o].system != b->systems)
+                {
+                    ERR("particle batching: heap entry %u is shared by systems %u and %u, batching off.\n",
+                            idx, b->owned[o].system, b->systems);
+                    return false;
+                }
+                break;
+            }
+        }
+        if (o == b->owned_count)
+        {
+            if (b->owned_count == VKD3D_PARTICLE_MAX_OWNED)
+                return false;
+            b->owned[b->owned_count].index = idx;
+            b->owned[b->owned_count++].system = b->systems;
+        }
+
+        target = index ? vkd3d_particle_scratch_copy(list->device, scratch, index) : NULL;
+        if (index && !target)
+            return false;
+        want_va = target ? target->res.va : scratch->va;
+        if (views[idx].info.buffer.va == want_va)
+            continue;
+        if (!target)
+        {
+            /* System 0 reads a copy: only possible if the engine reused a table across frames. */
+            ERR("particle batching: entry %u of system 0 points at a scratch copy, batching off.\n", idx);
+            return false;
+        }
+
+        format = vkd3d_get_format(list->device, views[idx].info.buffer.dxgi_format, false);
+        if (!format || !format->byte_count || views[idx].info.buffer.dxgi_format == DXGI_FORMAT_UNKNOWN)
+            return false;
+        handle.ptr = heap->cpu_va.ptr + (SIZE_T)idx *
+                d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (access->e[i].uav)
+        {
+            memset(&uav_desc, 0, sizeof(uav_desc));
+            uav_desc.Format = views[idx].info.buffer.dxgi_format;
+            uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav_desc.Buffer.NumElements = scratch->range / format->byte_count;
+            list->device->ID3D12Device_iface.lpVtbl->CreateUnorderedAccessView(&list->device->ID3D12Device_iface,
+                    (ID3D12Resource *)&target->ID3D12Resource_iface, NULL, &uav_desc, handle);
+        }
+        else
+        {
+            memset(&srv_desc, 0, sizeof(srv_desc));
+            srv_desc.Format = views[idx].info.buffer.dxgi_format;
+            srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv_desc.Buffer.NumElements = scratch->range / format->byte_count;
+            list->device->ID3D12Device_iface.lpVtbl->CreateShaderResourceView(&list->device->ID3D12Device_iface,
+                    (ID3D12Resource *)&target->ID3D12Resource_iface, &srv_desc, handle);
+        }
+        if (views[idx].info.buffer.va != want_va)
+        {
+            ERR("particle batching: rewriting entry %u did not take, batching off.\n", idx);
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t d3d12_command_list_compute_hash(struct d3d12_command_list *list)
+{
+    return d3d12_pipeline_state_is_compute(list->state) ? list->state->compute.code.meta.hash : 0;
+}
+
+static VkCommandBuffer d3d12_command_list_particle_secondary(struct d3d12_command_list *list)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct d3d12_command_allocator *allocator = list->allocator;
+    VkCommandBufferInheritanceInfo inheritance;
+    VkCommandBufferAllocateInfo alloc_info;
+    VkCommandPoolCreateInfo pool_info;
+    VkCommandBufferBeginInfo begin_info;
+    VkCommandBuffer cb;
+
+    if (!allocator->particle_pool)
+    {
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.pNext = NULL;
+        pool_info.flags = 0;
+        pool_info.queueFamilyIndex = allocator->primary_pool.vk_family_index;
+        if (VK_CALL(vkCreateCommandPool(list->device->vk_device, &pool_info, NULL, &allocator->particle_pool)))
+        {
+            allocator->particle_pool = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
+        }
+    }
+    if (allocator->particle_cb_used == allocator->particle_cb_count)
+    {
+        if (!vkd3d_array_reserve((void **)&allocator->particle_cbs, &allocator->particle_cbs_size,
+                allocator->particle_cb_count + 1, sizeof(*allocator->particle_cbs)))
+            return VK_NULL_HANDLE;
+        alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc_info.pNext = NULL;
+        alloc_info.commandPool = allocator->particle_pool;
+        alloc_info.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        alloc_info.commandBufferCount = 1;
+        if (VK_CALL(vkAllocateCommandBuffers(list->device->vk_device, &alloc_info, &cb)))
+            return VK_NULL_HANDLE;
+        allocator->particle_cbs[allocator->particle_cb_count++] = cb;
+    }
+    cb = allocator->particle_cbs[allocator->particle_cb_used++];
+
+    memset(&inheritance, 0, sizeof(inheritance));
+    inheritance.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.pNext = NULL;
+    begin_info.flags = 0;
+    begin_info.pInheritanceInfo = &inheritance;
+    if (VK_CALL(vkBeginCommandBuffer(cb, &begin_info)))
+        return VK_NULL_HANDLE;
+    return cb;
+}
+
+static void d3d12_command_list_particle_switch(struct d3d12_command_list *list, VkCommandBuffer cb)
+{
+    if (list->cmd.vk_command_buffer == cb)
+        return;
+    list->cmd.vk_command_buffer = cb;
+    /* Bindings are per command buffer: the next dispatch binds everything again. */
+    d3d12_command_list_invalidate_all_state(list);
+    list->descriptor_heap.buffers.global_heap_dirty = true;
+}
+
+static void d3d12_command_list_particle_full_barrier(struct d3d12_command_list *list)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkMemoryBarrier2 barrier;
+    VkDependencyInfo dep;
+
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    memset(&dep, 0, sizeof(dep));
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep));
+}
+
+static void d3d12_command_list_particle_splice(struct d3d12_command_list *list)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct vkd3d_particle_batch *b = &list->particle;
+    unsigned int i;
+
+    if (!b->real_vtbl)
+        return;
+    list->ID3D12GraphicsCommandList_iface.lpVtbl = (void *)b->real_vtbl;
+    b->real_vtbl = NULL;
+
+    d3d12_command_list_end_transfer_batch(list);
+    for (i = 0; i < b->phase_count; i++)
+        VK_CALL(vkEndCommandBuffer(b->phases[i]));
+    list->cmd.vk_command_buffer = b->main_cb;
+    for (i = 0; i < b->phase_count; i++)
+    {
+        d3d12_command_list_particle_full_barrier(list);
+        VK_CALL(vkCmdExecuteCommands(list->cmd.vk_command_buffer, 1, &b->phases[i]));
+    }
+    d3d12_command_list_particle_full_barrier(list);
+    d3d12_command_list_invalidate_all_state(list);
+    list->descriptor_heap.buffers.global_heap_dirty = true;
+
+    vkd3d_particle_stat_batches++;
+    vkd3d_particle_stat_systems += b->systems;
+    vkd3d_particle_stat_phases += b->phase_count;
+    if (!(vkd3d_particle_stat_batches % 4096))
+        INFO("particle batching: %"PRIu64" batches, %.1f systems and %.1f phases each.\n",
+                vkd3d_particle_stat_batches, (double)vkd3d_particle_stat_systems / vkd3d_particle_stat_batches,
+                (double)vkd3d_particle_stat_phases / vkd3d_particle_stat_batches);
+    b->phase_count = b->systems = b->step = 0;
+    b->pending_step = false;
+    b->owned_count = 0;
+}
+
+/* Called from the guard vtable's thunks (below) before any call that is not part of a batch. */
+void __attribute__((used)) vkd3d_particle_guard_splice(d3d12_command_list_iface *iface, size_t slot)
+{
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+
+    if (list->particle.real_vtbl)
+        d3d12_command_list_particle_splice(list);
+    else
+    {
+        vkd3d_pdraw_stat_guard[slot & 127]++;
+        d3d12_command_list_pdraw_flush(list);
+    }
+}
+
+/* Guard thunks: splice, then jump to the same slot of the (restored) real vtable. MS x64 ABI:
+ * rcx = this, rdx/r8/r9/xmm0-3 = arguments, the rest on the stack, which is left untouched. */
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    "vkd3d_particle_guard_common:\n"
+    "    subq $0xa8, %rsp\n"
+    "    movq %rcx, 0x20(%rsp)\n"
+    "    movq %rdx, 0x28(%rsp)\n"
+    "    movq %r8, 0x30(%rsp)\n"
+    "    movq %r9, 0x38(%rsp)\n"
+    "    movq %rax, 0x40(%rsp)\n"
+    "    movaps %xmm0, 0x50(%rsp)\n"
+    "    movaps %xmm1, 0x60(%rsp)\n"
+    "    movaps %xmm2, 0x70(%rsp)\n"
+    "    movaps %xmm3, 0x80(%rsp)\n"
+    "    movq %rax, %rdx\n"
+    "    call vkd3d_particle_guard_splice\n"
+    "    movaps 0x50(%rsp), %xmm0\n"
+    "    movaps 0x60(%rsp), %xmm1\n"
+    "    movaps 0x70(%rsp), %xmm2\n"
+    "    movaps 0x80(%rsp), %xmm3\n"
+    "    movq 0x40(%rsp), %rax\n"
+    "    movq 0x38(%rsp), %r9\n"
+    "    movq 0x30(%rsp), %r8\n"
+    "    movq 0x28(%rsp), %rdx\n"
+    "    movq 0x20(%rsp), %rcx\n"
+    "    addq $0xa8, %rsp\n"
+    "    movq (%rcx), %r10\n"
+    "    jmp *(%r10,%rax,8)\n"
+    "vkd3d_pg_thunk_0:\n movl $0, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_1:\n movl $1, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_2:\n movl $2, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_3:\n movl $3, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_4:\n movl $4, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_5:\n movl $5, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_6:\n movl $6, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_7:\n movl $7, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_8:\n movl $8, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_9:\n movl $9, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_10:\n movl $10, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_11:\n movl $11, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_12:\n movl $12, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_13:\n movl $13, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_14:\n movl $14, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_15:\n movl $15, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_16:\n movl $16, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_17:\n movl $17, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_18:\n movl $18, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_19:\n movl $19, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_20:\n movl $20, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_21:\n movl $21, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_22:\n movl $22, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_23:\n movl $23, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_24:\n movl $24, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_25:\n movl $25, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_26:\n movl $26, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_27:\n movl $27, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_28:\n movl $28, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_29:\n movl $29, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_30:\n movl $30, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_31:\n movl $31, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_32:\n movl $32, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_33:\n movl $33, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_34:\n movl $34, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_35:\n movl $35, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_36:\n movl $36, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_37:\n movl $37, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_38:\n movl $38, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_39:\n movl $39, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_40:\n movl $40, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_41:\n movl $41, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_42:\n movl $42, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_43:\n movl $43, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_44:\n movl $44, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_45:\n movl $45, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_46:\n movl $46, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_47:\n movl $47, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_48:\n movl $48, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_49:\n movl $49, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_50:\n movl $50, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_51:\n movl $51, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_52:\n movl $52, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_53:\n movl $53, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_54:\n movl $54, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_55:\n movl $55, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_56:\n movl $56, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_57:\n movl $57, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_58:\n movl $58, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_59:\n movl $59, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_60:\n movl $60, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_61:\n movl $61, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_62:\n movl $62, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_63:\n movl $63, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_64:\n movl $64, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_65:\n movl $65, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_66:\n movl $66, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_67:\n movl $67, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_68:\n movl $68, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_69:\n movl $69, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_70:\n movl $70, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_71:\n movl $71, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_72:\n movl $72, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_73:\n movl $73, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_74:\n movl $74, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_75:\n movl $75, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_76:\n movl $76, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_77:\n movl $77, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_78:\n movl $78, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_79:\n movl $79, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_80:\n movl $80, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_81:\n movl $81, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_82:\n movl $82, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_83:\n movl $83, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_84:\n movl $84, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_85:\n movl $85, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_86:\n movl $86, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_87:\n movl $87, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_88:\n movl $88, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_89:\n movl $89, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_90:\n movl $90, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_91:\n movl $91, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_92:\n movl $92, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_93:\n movl $93, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_94:\n movl $94, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_95:\n movl $95, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_96:\n movl $96, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_97:\n movl $97, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_98:\n movl $98, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_99:\n movl $99, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_100:\n movl $100, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_101:\n movl $101, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_102:\n movl $102, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_103:\n movl $103, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_104:\n movl $104, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_105:\n movl $105, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_106:\n movl $106, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_107:\n movl $107, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_108:\n movl $108, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_109:\n movl $109, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_110:\n movl $110, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_111:\n movl $111, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_112:\n movl $112, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_113:\n movl $113, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_114:\n movl $114, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_115:\n movl $115, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_116:\n movl $116, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_117:\n movl $117, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_118:\n movl $118, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_119:\n movl $119, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_120:\n movl $120, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_121:\n movl $121, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_122:\n movl $122, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_123:\n movl $123, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_124:\n movl $124, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_125:\n movl $125, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_126:\n movl $126, %eax\n jmp vkd3d_particle_guard_common\n"
+    "vkd3d_pg_thunk_127:\n movl $127, %eax\n jmp vkd3d_particle_guard_common\n"
+);
+extern void vkd3d_pg_thunk_0(void);
+extern void vkd3d_pg_thunk_1(void);
+extern void vkd3d_pg_thunk_2(void);
+extern void vkd3d_pg_thunk_3(void);
+extern void vkd3d_pg_thunk_4(void);
+extern void vkd3d_pg_thunk_5(void);
+extern void vkd3d_pg_thunk_6(void);
+extern void vkd3d_pg_thunk_7(void);
+extern void vkd3d_pg_thunk_8(void);
+extern void vkd3d_pg_thunk_9(void);
+extern void vkd3d_pg_thunk_10(void);
+extern void vkd3d_pg_thunk_11(void);
+extern void vkd3d_pg_thunk_12(void);
+extern void vkd3d_pg_thunk_13(void);
+extern void vkd3d_pg_thunk_14(void);
+extern void vkd3d_pg_thunk_15(void);
+extern void vkd3d_pg_thunk_16(void);
+extern void vkd3d_pg_thunk_17(void);
+extern void vkd3d_pg_thunk_18(void);
+extern void vkd3d_pg_thunk_19(void);
+extern void vkd3d_pg_thunk_20(void);
+extern void vkd3d_pg_thunk_21(void);
+extern void vkd3d_pg_thunk_22(void);
+extern void vkd3d_pg_thunk_23(void);
+extern void vkd3d_pg_thunk_24(void);
+extern void vkd3d_pg_thunk_25(void);
+extern void vkd3d_pg_thunk_26(void);
+extern void vkd3d_pg_thunk_27(void);
+extern void vkd3d_pg_thunk_28(void);
+extern void vkd3d_pg_thunk_29(void);
+extern void vkd3d_pg_thunk_30(void);
+extern void vkd3d_pg_thunk_31(void);
+extern void vkd3d_pg_thunk_32(void);
+extern void vkd3d_pg_thunk_33(void);
+extern void vkd3d_pg_thunk_34(void);
+extern void vkd3d_pg_thunk_35(void);
+extern void vkd3d_pg_thunk_36(void);
+extern void vkd3d_pg_thunk_37(void);
+extern void vkd3d_pg_thunk_38(void);
+extern void vkd3d_pg_thunk_39(void);
+extern void vkd3d_pg_thunk_40(void);
+extern void vkd3d_pg_thunk_41(void);
+extern void vkd3d_pg_thunk_42(void);
+extern void vkd3d_pg_thunk_43(void);
+extern void vkd3d_pg_thunk_44(void);
+extern void vkd3d_pg_thunk_45(void);
+extern void vkd3d_pg_thunk_46(void);
+extern void vkd3d_pg_thunk_47(void);
+extern void vkd3d_pg_thunk_48(void);
+extern void vkd3d_pg_thunk_49(void);
+extern void vkd3d_pg_thunk_50(void);
+extern void vkd3d_pg_thunk_51(void);
+extern void vkd3d_pg_thunk_52(void);
+extern void vkd3d_pg_thunk_53(void);
+extern void vkd3d_pg_thunk_54(void);
+extern void vkd3d_pg_thunk_55(void);
+extern void vkd3d_pg_thunk_56(void);
+extern void vkd3d_pg_thunk_57(void);
+extern void vkd3d_pg_thunk_58(void);
+extern void vkd3d_pg_thunk_59(void);
+extern void vkd3d_pg_thunk_60(void);
+extern void vkd3d_pg_thunk_61(void);
+extern void vkd3d_pg_thunk_62(void);
+extern void vkd3d_pg_thunk_63(void);
+extern void vkd3d_pg_thunk_64(void);
+extern void vkd3d_pg_thunk_65(void);
+extern void vkd3d_pg_thunk_66(void);
+extern void vkd3d_pg_thunk_67(void);
+extern void vkd3d_pg_thunk_68(void);
+extern void vkd3d_pg_thunk_69(void);
+extern void vkd3d_pg_thunk_70(void);
+extern void vkd3d_pg_thunk_71(void);
+extern void vkd3d_pg_thunk_72(void);
+extern void vkd3d_pg_thunk_73(void);
+extern void vkd3d_pg_thunk_74(void);
+extern void vkd3d_pg_thunk_75(void);
+extern void vkd3d_pg_thunk_76(void);
+extern void vkd3d_pg_thunk_77(void);
+extern void vkd3d_pg_thunk_78(void);
+extern void vkd3d_pg_thunk_79(void);
+extern void vkd3d_pg_thunk_80(void);
+extern void vkd3d_pg_thunk_81(void);
+extern void vkd3d_pg_thunk_82(void);
+extern void vkd3d_pg_thunk_83(void);
+extern void vkd3d_pg_thunk_84(void);
+extern void vkd3d_pg_thunk_85(void);
+extern void vkd3d_pg_thunk_86(void);
+extern void vkd3d_pg_thunk_87(void);
+extern void vkd3d_pg_thunk_88(void);
+extern void vkd3d_pg_thunk_89(void);
+extern void vkd3d_pg_thunk_90(void);
+extern void vkd3d_pg_thunk_91(void);
+extern void vkd3d_pg_thunk_92(void);
+extern void vkd3d_pg_thunk_93(void);
+extern void vkd3d_pg_thunk_94(void);
+extern void vkd3d_pg_thunk_95(void);
+extern void vkd3d_pg_thunk_96(void);
+extern void vkd3d_pg_thunk_97(void);
+extern void vkd3d_pg_thunk_98(void);
+extern void vkd3d_pg_thunk_99(void);
+extern void vkd3d_pg_thunk_100(void);
+extern void vkd3d_pg_thunk_101(void);
+extern void vkd3d_pg_thunk_102(void);
+extern void vkd3d_pg_thunk_103(void);
+extern void vkd3d_pg_thunk_104(void);
+extern void vkd3d_pg_thunk_105(void);
+extern void vkd3d_pg_thunk_106(void);
+extern void vkd3d_pg_thunk_107(void);
+extern void vkd3d_pg_thunk_108(void);
+extern void vkd3d_pg_thunk_109(void);
+extern void vkd3d_pg_thunk_110(void);
+extern void vkd3d_pg_thunk_111(void);
+extern void vkd3d_pg_thunk_112(void);
+extern void vkd3d_pg_thunk_113(void);
+extern void vkd3d_pg_thunk_114(void);
+extern void vkd3d_pg_thunk_115(void);
+extern void vkd3d_pg_thunk_116(void);
+extern void vkd3d_pg_thunk_117(void);
+extern void vkd3d_pg_thunk_118(void);
+extern void vkd3d_pg_thunk_119(void);
+extern void vkd3d_pg_thunk_120(void);
+extern void vkd3d_pg_thunk_121(void);
+extern void vkd3d_pg_thunk_122(void);
+extern void vkd3d_pg_thunk_123(void);
+extern void vkd3d_pg_thunk_124(void);
+extern void vkd3d_pg_thunk_125(void);
+extern void vkd3d_pg_thunk_126(void);
+extern void vkd3d_pg_thunk_127(void);
+static void (*const vkd3d_pg_thunks[128])(void) =
+{
+    vkd3d_pg_thunk_0, vkd3d_pg_thunk_1, vkd3d_pg_thunk_2, vkd3d_pg_thunk_3, vkd3d_pg_thunk_4, vkd3d_pg_thunk_5, vkd3d_pg_thunk_6, vkd3d_pg_thunk_7,
+    vkd3d_pg_thunk_8, vkd3d_pg_thunk_9, vkd3d_pg_thunk_10, vkd3d_pg_thunk_11, vkd3d_pg_thunk_12, vkd3d_pg_thunk_13, vkd3d_pg_thunk_14, vkd3d_pg_thunk_15,
+    vkd3d_pg_thunk_16, vkd3d_pg_thunk_17, vkd3d_pg_thunk_18, vkd3d_pg_thunk_19, vkd3d_pg_thunk_20, vkd3d_pg_thunk_21, vkd3d_pg_thunk_22, vkd3d_pg_thunk_23,
+    vkd3d_pg_thunk_24, vkd3d_pg_thunk_25, vkd3d_pg_thunk_26, vkd3d_pg_thunk_27, vkd3d_pg_thunk_28, vkd3d_pg_thunk_29, vkd3d_pg_thunk_30, vkd3d_pg_thunk_31,
+    vkd3d_pg_thunk_32, vkd3d_pg_thunk_33, vkd3d_pg_thunk_34, vkd3d_pg_thunk_35, vkd3d_pg_thunk_36, vkd3d_pg_thunk_37, vkd3d_pg_thunk_38, vkd3d_pg_thunk_39,
+    vkd3d_pg_thunk_40, vkd3d_pg_thunk_41, vkd3d_pg_thunk_42, vkd3d_pg_thunk_43, vkd3d_pg_thunk_44, vkd3d_pg_thunk_45, vkd3d_pg_thunk_46, vkd3d_pg_thunk_47,
+    vkd3d_pg_thunk_48, vkd3d_pg_thunk_49, vkd3d_pg_thunk_50, vkd3d_pg_thunk_51, vkd3d_pg_thunk_52, vkd3d_pg_thunk_53, vkd3d_pg_thunk_54, vkd3d_pg_thunk_55,
+    vkd3d_pg_thunk_56, vkd3d_pg_thunk_57, vkd3d_pg_thunk_58, vkd3d_pg_thunk_59, vkd3d_pg_thunk_60, vkd3d_pg_thunk_61, vkd3d_pg_thunk_62, vkd3d_pg_thunk_63,
+    vkd3d_pg_thunk_64, vkd3d_pg_thunk_65, vkd3d_pg_thunk_66, vkd3d_pg_thunk_67, vkd3d_pg_thunk_68, vkd3d_pg_thunk_69, vkd3d_pg_thunk_70, vkd3d_pg_thunk_71,
+    vkd3d_pg_thunk_72, vkd3d_pg_thunk_73, vkd3d_pg_thunk_74, vkd3d_pg_thunk_75, vkd3d_pg_thunk_76, vkd3d_pg_thunk_77, vkd3d_pg_thunk_78, vkd3d_pg_thunk_79,
+    vkd3d_pg_thunk_80, vkd3d_pg_thunk_81, vkd3d_pg_thunk_82, vkd3d_pg_thunk_83, vkd3d_pg_thunk_84, vkd3d_pg_thunk_85, vkd3d_pg_thunk_86, vkd3d_pg_thunk_87,
+    vkd3d_pg_thunk_88, vkd3d_pg_thunk_89, vkd3d_pg_thunk_90, vkd3d_pg_thunk_91, vkd3d_pg_thunk_92, vkd3d_pg_thunk_93, vkd3d_pg_thunk_94, vkd3d_pg_thunk_95,
+    vkd3d_pg_thunk_96, vkd3d_pg_thunk_97, vkd3d_pg_thunk_98, vkd3d_pg_thunk_99, vkd3d_pg_thunk_100, vkd3d_pg_thunk_101, vkd3d_pg_thunk_102, vkd3d_pg_thunk_103,
+    vkd3d_pg_thunk_104, vkd3d_pg_thunk_105, vkd3d_pg_thunk_106, vkd3d_pg_thunk_107, vkd3d_pg_thunk_108, vkd3d_pg_thunk_109, vkd3d_pg_thunk_110, vkd3d_pg_thunk_111,
+    vkd3d_pg_thunk_112, vkd3d_pg_thunk_113, vkd3d_pg_thunk_114, vkd3d_pg_thunk_115, vkd3d_pg_thunk_116, vkd3d_pg_thunk_117, vkd3d_pg_thunk_118, vkd3d_pg_thunk_119,
+    vkd3d_pg_thunk_120, vkd3d_pg_thunk_121, vkd3d_pg_thunk_122, vkd3d_pg_thunk_123, vkd3d_pg_thunk_124, vkd3d_pg_thunk_125, vkd3d_pg_thunk_126, vkd3d_pg_thunk_127
+};
+
+#define VKD3D_PG_SLOT(m) (offsetof(struct ID3D12GraphicsCommandList10Vtbl, m) / sizeof(void *))
+#define VKD3D_PG_SLOTS (sizeof(struct ID3D12GraphicsCommandList10Vtbl) / sizeof(void *))
+
+static const void *vkd3d_particle_guard_vtbl(const void *real)
+{
+    /* Calls that only set state or are part of a batch go straight through. */
+    static const size_t pass[] =
+    {
+        VKD3D_PG_SLOT(QueryInterface), VKD3D_PG_SLOT(AddRef), VKD3D_PG_SLOT(Release),
+        VKD3D_PG_SLOT(GetPrivateData), VKD3D_PG_SLOT(SetPrivateData), VKD3D_PG_SLOT(SetPrivateDataInterface),
+        VKD3D_PG_SLOT(SetName), VKD3D_PG_SLOT(GetDevice), VKD3D_PG_SLOT(GetType),
+        VKD3D_PG_SLOT(Dispatch), VKD3D_PG_SLOT(CopyBufferRegion), VKD3D_PG_SLOT(SetPipelineState),
+        VKD3D_PG_SLOT(ResourceBarrier), VKD3D_PG_SLOT(SetDescriptorHeaps), VKD3D_PG_SLOT(SetComputeRootSignature),
+        VKD3D_PG_SLOT(SetComputeRootDescriptorTable), VKD3D_PG_SLOT(SetComputeRoot32BitConstant),
+        VKD3D_PG_SLOT(SetComputeRoot32BitConstants), VKD3D_PG_SLOT(SetComputeRootConstantBufferView),
+        VKD3D_PG_SLOT(SetComputeRootShaderResourceView), VKD3D_PG_SLOT(SetComputeRootUnorderedAccessView),
+        VKD3D_PG_SLOT(ExecuteIndirect),
+    };
+    static struct { const void *real; void *slots[VKD3D_PG_SLOTS]; } guards[8];
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    const void *ret = NULL;
+    unsigned int i, j;
+
+    STATIC_ASSERT(VKD3D_PG_SLOTS <= ARRAY_SIZE(vkd3d_pg_thunks));
+    pthread_mutex_lock(&lock);
+    for (i = 0; i < ARRAY_SIZE(guards) && guards[i].real; i++)
+    {
+        if (guards[i].real == real)
+            break;
+    }
+    if (i < ARRAY_SIZE(guards))
+    {
+        if (!guards[i].real)
+        {
+            memcpy(guards[i].slots, real, sizeof(guards[i].slots));
+            for (j = 0; j < VKD3D_PG_SLOTS; j++)
+                guards[i].slots[j] = (void *)vkd3d_pg_thunks[j];
+            for (j = 0; j < ARRAY_SIZE(pass); j++)
+                guards[i].slots[pass[j]] = ((void * const *)real)[pass[j]];
+            guards[i].real = real;
+        }
+        ret = guards[i].slots;
+    }
+    pthread_mutex_unlock(&lock);
+    return ret;
+}
+
+/* miles-bench: particle draw constants (VKD3D_BENCH_PDRAW=1; live off switch: feature bit 0x400).
+ *
+ * After the particle simulation the engine draws each system (~60 per frame) as: transition a
+ * 3840-byte constant buffer GENERIC_READ -> COPY_DEST, copy 3840 bytes into it from the upload
+ * heap, transition it back, draw. Eight or so such buffers are reused round-robin, so every copy
+ * has to wait until the draws before it are done with the buffers: the GPU drains ~60 times per
+ * frame and every draw gets a render pass of its own.
+ *
+ * Here a draw reads its constants where the copy took them from (the engine fills the upload heap
+ * before it submits and leaves it alone until the GPU is done, the lifetime the copy itself relies
+ * on). The copies are kept, in their original order, but deferred to the first command outside the
+ * pattern, behind one barrier, so every buffer ends up with exactly the bytes it had before.
+ *
+ * How a draw is pointed at the upload heap without touching any descriptor the engine owns: the
+ * large resource heap has VKD3D_PDRAW_TAIL private descriptors past the app's last one
+ * (resource.c, state.c). The draw's CBV table whose first entry views a buffer with a pending copy
+ * gets a private descriptor with the same view of the upload heap bytes, and the table is pointed
+ * there for that draw only; the engine's base is put back before the next draw. Only the particle
+ * shaders (hashes below) are treated this way; they read the first descriptor of each table and
+ * nothing else (checked in their SPIR-V). Any other read of a buffer with a pending copy: another
+ * table entry, another kind of view, vertex/index/indirect buffers, root descriptors, another
+ * shader, any call the guard vtable does not let through, flushes the copies first.
+ *
+ * The private descriptors are used round-robin: one is written again ~3800 draws into the same
+ * heap (~60 frames) after it was used, long after the GPU has executed that frame. The game's CBV
+ * ranges are volatile (it may write a descriptor until it submits), so every engine descriptor a
+ * redirect was made from is compared again at ExecuteCommandLists (d3d12_command_list_pdraw_verify). */
+#define VKD3D_PDRAW_SIZE 3840
+static int vkd3d_pdraw_state = -1;
+static uint64_t vkd3d_pdraw_stat_flushes, vkd3d_pdraw_stat_draws, vkd3d_pdraw_stat_copies, vkd3d_pdraw_stat_redirects;
+static uint64_t vkd3d_pdraw_stat_checked, vkd3d_pdraw_stat_changed, vkd3d_pdraw_stat_unchecked;
+/* Why draws flushed: 0 mid-pattern, 1 off/no state, 2 root descriptor, 3 mixed table, 4 heap bounds/big range, 5 not a particle shader,
+ * 6 non-CBV view of a pending buffer, 7 CBV not covered, 8 not first in table, 9 too many tables. */
+static uint64_t vkd3d_pdraw_stat_why[10];
+#define PDRAW_FLUSH(r) do { vkd3d_pdraw_stat_why[r]++; goto flush; } while (0)
+
+uint32_t vkd3d_pdraw_tail_count(void)
+{
+    static int tail = -1;
+    char env[16];
+
+    if (tail < 0)
+        tail = vkd3d_get_env_var("VKD3D_BENCH_PDRAW", env, sizeof(env)) && atoi(env) >= 1 ? VKD3D_PDRAW_TAIL : 0;
+    return tail;
+}
+
+static bool vkd3d_pdraw_enabled(void)
+{
+    char env[16];
+
+    if (vkd3d_pdraw_state < 0)
+    {
+        vkd3d_pdraw_state = vkd3d_get_env_var("VKD3D_BENCH_PDRAW", env, sizeof(env)) && atoi(env) >= 1;
+    }
+    return vkd3d_pdraw_state > 0 && !(vkd3d_bench_features() & VKD3D_BENCH_FEATURE_PDRAW_OFF);
+}
+
+static bool vkd3d_pdraw_overlaps(const struct vkd3d_pdraw *d, VkDeviceAddress va, VkDeviceSize size)
+{
+    VkDeviceAddress lo;
+    unsigned int i;
+
+    size = max(size, 1);
+    for (i = 0; i < d->copy_count; i++)
+    {
+        lo = d->copies[i].dst->res.va + d->copies[i].dst_offset;
+        if (va < lo + d->copies[i].size && lo < va + size)
+            return true;
+    }
+    return d->phase == 1 && d->target && va < d->target->res.va + d->target->desc.Width &&
+            d->target->res.va < va + size;
+}
+
+static void d3d12_command_list_pdraw_flush(struct d3d12_command_list *list)
+{
+    D3D12_RESOURCE_BARRIER barriers[VKD3D_PDRAW_MAX_COPIES + 1];
+    struct vkd3d_pdraw *d = &list->pdraw;
+    struct d3d12_resource *t;
+    unsigned int i, j, n;
+
+    if (!d->real_vtbl)
+        return;
+    list->ID3D12GraphicsCommandList_iface.lpVtbl = (void *)d->real_vtbl;
+    d->real_vtbl = NULL;
+    d->flushing = true;
+
+    /* GENERIC_READ -> COPY_DEST for every buffer with a pending copy (and one whose copy is next). */
+    for (i = n = 0; i <= d->copy_count; i++)
+    {
+        if (!(t = i < d->copy_count ? d->copies[i].dst : d->phase == 1 ? d->target : NULL))
+            continue;
+        for (j = 0; j < n && barriers[j].Transition.pResource != (ID3D12Resource *)&t->ID3D12Resource_iface; j++)
+            ;
+        if (j < n)
+            continue;
+        memset(&barriers[n], 0, sizeof(barriers[n]));
+        barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[n].Transition.pResource = (ID3D12Resource *)&t->ID3D12Resource_iface;
+        barriers[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[n].Transition.StateBefore = D3D12_RESOURCE_STATE_GENERIC_READ;
+        barriers[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        n++;
+    }
+    if (n)
+        d3d12_command_list_ResourceBarrier(&list->ID3D12GraphicsCommandList_iface, n, barriers);
+    for (i = 0; i < d->copy_count; i++)
+        d3d12_command_list_CopyBufferRegion(&list->ID3D12GraphicsCommandList_iface,
+                (ID3D12Resource *)&d->copies[i].dst->ID3D12Resource_iface, d->copies[i].dst_offset,
+                (ID3D12Resource *)&d->copies[i].src->ID3D12Resource_iface, d->copies[i].src_offset, d->copies[i].size);
+    /* Back to GENERIC_READ, except a buffer whose transition back the engine has not issued yet. */
+    for (i = n = 0; i < d->copy_count; i++)
+    {
+        t = d->copies[i].dst;
+        if ((d->phase == 1 || d->phase == 2) && t == d->target)
+            continue;
+        for (j = 0; j < n && barriers[j].Transition.pResource != (ID3D12Resource *)&t->ID3D12Resource_iface; j++)
+            ;
+        if (j < n)
+            continue;
+        memset(&barriers[n], 0, sizeof(barriers[n]));
+        barriers[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[n].Transition.pResource = (ID3D12Resource *)&t->ID3D12Resource_iface;
+        barriers[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[n].Transition.StateAfter = D3D12_RESOURCE_STATE_GENERIC_READ;
+        n++;
+    }
+    if (n)
+        d3d12_command_list_ResourceBarrier(&list->ID3D12GraphicsCommandList_iface, n, barriers);
+
+    vkd3d_pdraw_stat_flushes++;
+    vkd3d_pdraw_stat_copies += d->copy_count;
+    if (!(vkd3d_pdraw_stat_flushes % 2048))
+        INFO("particle draws: %"PRIu64" flushes, %.1f copies, %.1f draws and %.1f redirected tables each; "
+                "draw flushes by reason %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64".\n",
+                vkd3d_pdraw_stat_flushes, (double)vkd3d_pdraw_stat_copies / vkd3d_pdraw_stat_flushes,
+                (double)vkd3d_pdraw_stat_draws / vkd3d_pdraw_stat_flushes,
+                (double)vkd3d_pdraw_stat_redirects / vkd3d_pdraw_stat_flushes,
+                vkd3d_pdraw_stat_why[0], vkd3d_pdraw_stat_why[1], vkd3d_pdraw_stat_why[2], vkd3d_pdraw_stat_why[3],
+                vkd3d_pdraw_stat_why[4], vkd3d_pdraw_stat_why[5], vkd3d_pdraw_stat_why[6], vkd3d_pdraw_stat_why[7],
+                vkd3d_pdraw_stat_why[8], vkd3d_pdraw_stat_why[9]);
+    if (!(vkd3d_pdraw_stat_flushes % 2048))
+    {
+        char line[512];
+        size_t n = 0;
+        for (i = 0; i < ARRAY_SIZE(vkd3d_pdraw_stat_guard) && n < sizeof(line) - 32; i++)
+            if (vkd3d_pdraw_stat_guard[i])
+                n += snprintf(line + n, sizeof(line) - n, " slot%u:%"PRIu64, i, vkd3d_pdraw_stat_guard[i]);
+        INFO("particle draws: flushes by vtable slot%s; at submission %"PRIu64" source descriptors checked, "
+                "%"PRIu64" changed, %"PRIu64" unchecked.\n", line, vkd3d_pdraw_stat_checked, vkd3d_pdraw_stat_changed,
+                vkd3d_pdraw_stat_unchecked);
+    }
+    d->copy_count = d->phase = 0;
+    d->target = NULL;
+    d->flushing = false;
+}
+
+static const void *vkd3d_pdraw_guard_vtbl(const void *real)
+{
+    /* Calls that only set graphics state or are part of the pattern go straight through. */
+    static const size_t pass[] =
+    {
+        VKD3D_PG_SLOT(QueryInterface), VKD3D_PG_SLOT(AddRef), VKD3D_PG_SLOT(Release),
+        VKD3D_PG_SLOT(GetPrivateData), VKD3D_PG_SLOT(SetPrivateData), VKD3D_PG_SLOT(SetPrivateDataInterface),
+        VKD3D_PG_SLOT(SetName), VKD3D_PG_SLOT(GetDevice), VKD3D_PG_SLOT(GetType),
+        VKD3D_PG_SLOT(DrawInstanced), VKD3D_PG_SLOT(DrawIndexedInstanced), VKD3D_PG_SLOT(ExecuteIndirect),
+        VKD3D_PG_SLOT(CopyBufferRegion), VKD3D_PG_SLOT(ResourceBarrier), VKD3D_PG_SLOT(SetPipelineState),
+        VKD3D_PG_SLOT(SetDescriptorHeaps), VKD3D_PG_SLOT(SetGraphicsRootSignature),
+        VKD3D_PG_SLOT(SetGraphicsRootDescriptorTable), VKD3D_PG_SLOT(SetGraphicsRoot32BitConstant),
+        VKD3D_PG_SLOT(SetGraphicsRoot32BitConstants), VKD3D_PG_SLOT(IASetPrimitiveTopology),
+        VKD3D_PG_SLOT(IASetIndexBuffer), VKD3D_PG_SLOT(IASetVertexBuffers), VKD3D_PG_SLOT(RSSetViewports),
+        VKD3D_PG_SLOT(RSSetScissorRects), VKD3D_PG_SLOT(OMSetRenderTargets), VKD3D_PG_SLOT(OMSetBlendFactor),
+        VKD3D_PG_SLOT(OMSetStencilRef), VKD3D_PG_SLOT(SetMarker), VKD3D_PG_SLOT(BeginEvent), VKD3D_PG_SLOT(EndEvent),
+    };
+    static struct { const void *real; void *slots[VKD3D_PG_SLOTS]; } guards[8];
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    const void *ret = NULL;
+    unsigned int i, j;
+
+    pthread_mutex_lock(&lock);
+    for (i = 0; i < ARRAY_SIZE(guards) && guards[i].real; i++)
+    {
+        if (guards[i].real == real)
+            break;
+    }
+    if (i < ARRAY_SIZE(guards))
+    {
+        if (!guards[i].real)
+        {
+            for (j = 0; j < VKD3D_PG_SLOTS; j++)
+                guards[i].slots[j] = (void *)vkd3d_pg_thunks[j];
+            for (j = 0; j < ARRAY_SIZE(pass); j++)
+                guards[i].slots[pass[j]] = ((void * const *)real)[pass[j]];
+            guards[i].real = real;
+        }
+        ret = guards[i].slots;
+    }
+    pthread_mutex_unlock(&lock);
+    return ret;
+}
+
+/* ResourceBarrier: true if the call is part of the pattern (and recorded nothing). */
+static bool d3d12_command_list_pdraw_barrier(struct d3d12_command_list *list,
+        UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+    struct vkd3d_pdraw *d = &list->pdraw;
+    struct d3d12_resource *res;
+    const void *guard;
+
+    if (d->flushing)
+        return false;
+    if (barrier_count == 1 && barriers[0].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && !barriers[0].Flags &&
+            barriers[0].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES &&
+            (res = impl_from_ID3D12Resource(barriers[0].Transition.pResource)) &&
+            d3d12_resource_is_buffer(res) && res->desc.Width == VKD3D_PDRAW_SIZE)
+    {
+        if (barriers[0].Transition.StateBefore == D3D12_RESOURCE_STATE_GENERIC_READ &&
+                barriers[0].Transition.StateAfter == D3D12_RESOURCE_STATE_COPY_DEST &&
+                (d->phase == 0 || d->phase == 3) && d->copy_count < VKD3D_PDRAW_MAX_COPIES)
+        {
+            if (!d->real_vtbl)
+            {
+                if (list->type != D3D12_COMMAND_LIST_TYPE_DIRECT || list->particle.real_vtbl || !vkd3d_pdraw_enabled() ||
+                        !(guard = vkd3d_pdraw_guard_vtbl(list->ID3D12GraphicsCommandList_iface.lpVtbl)))
+                    return false;
+                d->real_vtbl = list->ID3D12GraphicsCommandList_iface.lpVtbl;
+                list->ID3D12GraphicsCommandList_iface.lpVtbl = (void *)guard;
+            }
+            d->target = res;
+            d->phase = 1;
+            return true;
+        }
+        if (d->real_vtbl && d->phase == 2 && res == d->target &&
+                barriers[0].Transition.StateBefore == D3D12_RESOURCE_STATE_COPY_DEST &&
+                barriers[0].Transition.StateAfter == D3D12_RESOURCE_STATE_GENERIC_READ)
+        {
+            d->phase = 3;
+            return true;
+        }
+    }
+    d3d12_command_list_pdraw_flush(list);
+    return false;
+}
+
+/* CopyBufferRegion: true if the copy is the pattern's (and was deferred). */
+static bool d3d12_command_list_pdraw_copy(struct d3d12_command_list *list, struct d3d12_resource *dst,
+        uint64_t dst_offset, struct d3d12_resource *src, uint64_t src_offset, uint64_t size)
+{
+    struct vkd3d_pdraw *d = &list->pdraw;
+
+    if (d->flushing || !d->real_vtbl)
+        return false;
+    if (d->phase == 1 && dst == d->target && !dst_offset && size == VKD3D_PDRAW_SIZE &&
+            src->heap_properties.Type == D3D12_HEAP_TYPE_UPLOAD && !((src->res.va + src_offset) & 255))
+    {
+        d->copies[d->copy_count].dst = dst;
+        d->copies[d->copy_count].dst_offset = dst_offset;
+        d->copies[d->copy_count].src = src;
+        d->copies[d->copy_count].src_offset = src_offset;
+        d->copies[d->copy_count].size = size;
+        d->copy_count++;
+        d->phase = 2;
+        return true;
+    }
+    d3d12_command_list_pdraw_flush(list);
+    return false;
+}
+
+/* IASetIndexBuffer / IASetVertexBuffers / indirect arguments: a pending buffer read another way. */
+static void d3d12_command_list_pdraw_check_va(struct d3d12_command_list *list, VkDeviceAddress va, VkDeviceSize size)
+{
+    if (list->pdraw.real_vtbl && va && vkd3d_pdraw_overlaps(&list->pdraw, va, size))
+        d3d12_command_list_pdraw_flush(list);
+}
+
+/* Every draw: tables pointed at a private descriptor for the previous draw get the engine's base
+ * back (unless the engine has set them since). */
+static void d3d12_command_list_pdraw_restore(struct d3d12_command_list *list)
+{
+    struct vkd3d_pipeline_bindings *bindings = &list->graphics_bindings;
+    struct vkd3d_pdraw *d = &list->pdraw;
+    unsigned int i;
+
+    if (VKD3D_EXPECT_TRUE(!d->redirect_count))
+        return;
+    for (i = 0; i < d->redirect_count; i++)
+    {
+        if (bindings->descriptor_tables[d->redirects[i].param] != d->redirects[i].ours)
+            continue;
+        bindings->descriptor_tables[d->redirects[i].param] = d->redirects[i].engine;
+        if (bindings->root_signature && bindings->root_signature->descriptor_table_count)
+            bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS;
+        if (bindings->root_signature && bindings->root_signature->hoist_info.num_desc)
+            bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS;
+    }
+    d->redirect_count = 0;
+}
+
+void d3d12_command_list_pdraw_verify(struct d3d12_command_list *list)
+{
+    struct vkd3d_pdraw *d = &list->pdraw;
+    unsigned int i;
+
+    for (i = 0; i < d->check_count; i++)
+    {
+        vkd3d_pdraw_stat_checked++;
+        if (d->checks[i].view->info.buffer.va == d->checks[i].va && d->checks[i].view->info.buffer.range == d->checks[i].range &&
+                (d->checks[i].view->info.flags & VKD3D_DESCRIPTOR_FLAG_BUFFER_VA_RANGE))
+            continue;
+        if (!vkd3d_pdraw_stat_changed++)
+            ERR("particle draws: the engine changed a redirected draw's descriptor before submitting (%#"PRIx64" -> %#"PRIx64").\n",
+                    (uint64_t)d->checks[i].va, (uint64_t)d->checks[i].view->info.buffer.va);
+    }
+    d->check_count = 0;
+}
+
+/* The particle shaders (stage hashes): each reads the first descriptor of its tables only. */
+static bool vkd3d_pdraw_particle_shaders(const struct d3d12_pipeline_state *state)
+{
+    static const uint64_t vs[] =
+    {
+        0xa15eed22706963b7, 0xbdb9e1cdedf786ed, 0x9d0766dfe1a02616, 0x8dd24b2956c29fac, 0x936a997607023506,
+        0x87565022817437d8, 0x68367ae3b7ac5af5, 0x36dc1afaac6ae46e, 0x312e5a801a3fdfd6, 0xc1274e089494a1a0,
+    };
+    static const uint64_t ps[] =
+    {
+        0xf28c4e933d63c6d3, 0xea81bab6ad9abda0, 0x35510a1a80029ce7, 0xfb7a3389982e73d3, 0xc4e39d54c4b6506b,
+        0xd057e3f798123794,
+    };
+    const uint64_t *list;
+    unsigned int k, i, n;
+    uint64_t hash;
+
+    if (!state || d3d12_pipeline_state_is_compute(state))
+        return false;
+    for (k = 0; k < state->graphics.stage_count; k++)
+    {
+        if (state->graphics.stages[k].stage == VK_SHADER_STAGE_VERTEX_BIT)
+            list = vs, n = ARRAY_SIZE(vs);
+        else if (state->graphics.stages[k].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            list = ps, n = ARRAY_SIZE(ps);
+        else
+            return false;
+        hash = state->graphics.code[k].meta.hash;
+        for (i = 0; i < n && list[i] != hash; i++)
+            ;
+        if (i == n)
+            return false;
+    }
+    return true;
+}
+
+/* A draw (or a single-draw ExecuteIndirect) while copies are pending. */
+static void d3d12_command_list_pdraw_draw(struct d3d12_command_list *list)
+{
+    struct vkd3d_pipeline_bindings *bindings = &list->graphics_bindings;
+    const struct vkd3d_descriptor_metadata_view *views = list->cbv_srv_uav_descriptors_view;
+    struct d3d12_descriptor_heap *heap = list->descriptor_heap.buffers.resource.heap;
+    const struct d3d12_root_signature *rs = bindings->root_signature;
+    const struct vkd3d_shader_resource_binding *bind;
+    unsigned int p, b, k, i, c, idx, off, slot;
+    struct vkd3d_pdraw *d = &list->pdraw;
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv;
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    VkDeviceAddress va, dst_va, want;
+    bool particle, cbv_only;
+    struct
+    {
+        uint32_t param;
+        VkDeviceAddress va;
+        uint32_t range;
+        const struct vkd3d_descriptor_metadata_view *view;
+    } todo[ARRAY_SIZE(d->redirects)];
+    unsigned int todo_count = 0;
+
+    if (!d->real_vtbl)
+        return;
+    if (d->phase == 1 || d->phase == 2)
+        PDRAW_FLUSH(0);
+    if (!vkd3d_pdraw_enabled() || !rs || !views || !heap || !heap->pdraw_tail_base)
+        PDRAW_FLUSH(1);
+    particle = vkd3d_pdraw_particle_shaders(list->state);
+
+    for (p = 0; p < rs->parameter_count; p++)
+    {
+        if (rs->parameters[p].parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        {
+            if (rs->parameters[p].parameter_type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                PDRAW_FLUSH(2); /* a root CBV/SRV/UAV could point anywhere */
+            continue;
+        }
+        cbv_only = true;
+        for (b = 0; b < rs->parameters[p].descriptor_table.binding_count; b++)
+        {
+            if (rs->parameters[p].descriptor_table.first_binding[b].type != VKD3D_SHADER_DESCRIPTOR_TYPE_CBV)
+                cbv_only = false;
+        }
+        for (b = 0; b < rs->parameters[p].descriptor_table.binding_count; b++)
+        {
+            bind = &rs->parameters[p].descriptor_table.first_binding[b];
+            if (bind->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER)
+                continue;
+            for (k = 0; k < bind->register_count; k++)
+            {
+                off = bind->descriptor_offset + k;
+                /* The particle shaders read nothing past a table's first descriptor. */
+                if (particle && off)
+                    break;
+                idx = bindings->descriptor_tables[p] + off;
+                if (idx >= heap->pdraw_tail_base || (!particle && bind->register_count > 256))
+                    PDRAW_FLUSH(4);
+                if (!(views[idx].info.flags & VKD3D_DESCRIPTOR_FLAG_BUFFER_VA_RANGE))
+                    continue;
+                /* A slot is read only through a range of its own descriptor type (D3D12 requires
+                 * it): a CBV slot (no raw-VA aux buffer) only through CBV ranges, an SRV/UAV buffer
+                 * slot only through SRV/UAV ranges. The engine's CBV ring overlaps its SRV tables. */
+                if ((bind->type == VKD3D_SHADER_DESCRIPTOR_TYPE_CBV) !=
+                        !(views[idx].info.flags & VKD3D_DESCRIPTOR_FLAG_RAW_VA_AUX_BUFFER))
+                    continue;
+                va = views[idx].info.buffer.va;
+                if (!vkd3d_pdraw_overlaps(d, va, views[idx].info.buffer.range))
+                    continue;
+                if (bind->type != VKD3D_SHADER_DESCRIPTOR_TYPE_CBV)
+                    PDRAW_FLUSH(6);
+                if (!particle)
+                    PDRAW_FLUSH(5);
+                if (off)
+                    PDRAW_FLUSH(8);
+                if (!cbv_only)
+                    PDRAW_FLUSH(3);
+                /* The latest pending copy into that buffer has to cover the whole view. */
+                for (c = d->copy_count; c--;)
+                {
+                    dst_va = d->copies[c].dst->res.va + d->copies[c].dst_offset;
+                    if (va < dst_va + d->copies[c].size && dst_va < va + views[idx].info.buffer.range)
+                        break;
+                }
+                if (c == ~0u || va < dst_va || va + views[idx].info.buffer.range > dst_va + d->copies[c].size)
+                    PDRAW_FLUSH(7);
+                want = d->copies[c].src->res.va + d->copies[c].src_offset + (va - dst_va);
+                if (want & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+                    PDRAW_FLUSH(7);
+                for (i = 0; i < todo_count && todo[i].param != p; i++)
+                    ;
+                if (i < todo_count)
+                    continue;
+                if (todo_count == ARRAY_SIZE(todo))
+                    PDRAW_FLUSH(9);
+                todo[todo_count].param = p;
+                todo[todo_count].va = want;
+                todo[todo_count].range = views[idx].info.buffer.range;
+                todo[todo_count].view = &views[idx];
+                todo_count++;
+            }
+        }
+    }
+
+    for (i = 0; i < todo_count; i++)
+    {
+        /* Room for the whole table after the slot (only its first descriptor is read). */
+        slot = heap->pdraw_tail_base + __atomic_fetch_add(&heap->pdraw_tail_next, 1, __ATOMIC_RELAXED) %
+                (VKD3D_PDRAW_TAIL - 256);
+        handle.ptr = heap->cpu_va.ptr + (SIZE_T)slot *
+                d3d12_device_get_descriptor_handle_increment_size(list->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        cbv.BufferLocation = todo[i].va;
+        cbv.SizeInBytes = todo[i].range;
+        list->device->ID3D12Device_iface.lpVtbl->CreateConstantBufferView(&list->device->ID3D12Device_iface, &cbv, handle);
+        d->redirects[d->redirect_count].param = todo[i].param;
+        d->redirects[d->redirect_count].engine = bindings->descriptor_tables[todo[i].param];
+        d->redirects[d->redirect_count++].ours = slot;
+        bindings->descriptor_tables[todo[i].param] = slot;
+        if (d->check_count < ARRAY_SIZE(d->checks))
+        {
+            d->checks[d->check_count].view = todo[i].view;
+            d->checks[d->check_count].va = todo[i].view->info.buffer.va;
+            d->checks[d->check_count++].range = todo[i].view->info.buffer.range;
+        }
+        else
+            vkd3d_pdraw_stat_unchecked++;
+        if (rs->descriptor_table_count)
+            bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS;
+        if (rs->hoist_info.num_desc)
+            bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS;
+        vkd3d_pdraw_stat_redirects++;
+    }
+    vkd3d_pdraw_stat_draws++;
+    d->phase = 0;
+    return;
+
+flush:
+    d3d12_command_list_pdraw_flush(list);
+}
+
+static bool d3d12_command_list_particle_begin(struct d3d12_command_list *list)
+{
+    struct vkd3d_particle_batch *b = &list->particle;
+    const void *guard;
+
+    if ((list->type != D3D12_COMMAND_LIST_TYPE_DIRECT && list->type != D3D12_COMMAND_LIST_TYPE_COMPUTE) ||
+            list->predication.fallback_enabled || list->predication.current_enabled ||
+            list->predication.enabled_on_command_buffer)
+        return false;
+    if (!(guard = vkd3d_particle_guard_vtbl(list->ID3D12GraphicsCommandList_iface.lpVtbl)))
+        return false;
+
+    d3d12_command_list_flush_dgc_batch(list);
+    d3d12_command_list_end_current_render_pass(list, false);
+    d3d12_command_list_end_transfer_batch(list);
+    b->main_cb = list->cmd.vk_command_buffer;
+    b->phase_count = b->systems = b->step = 0;
+    b->pending_step = false;
+    b->owned_count = 0;
+    b->real_vtbl = list->ID3D12GraphicsCommandList_iface.lpVtbl;
+    list->ID3D12GraphicsCommandList_iface.lpVtbl = (void *)guard;
+    return true;
+}
+
+/* Feature bit 0x80: log the SRV/UAV table entries of the next 2000 particle dispatches. */
+static void d3d12_command_list_particle_diag(struct d3d12_command_list *list, uint64_t hash)
+{
+    const struct d3d12_root_signature *rs = list->compute_bindings.root_signature;
+    const struct vkd3d_descriptor_metadata_view *views = list->cbv_srv_uav_descriptors_view;
+    const struct vkd3d_shader_resource_binding *bind;
+    static int limit, armed;
+    static unsigned int sims;
+    unsigned int p, b, k, idx, base, count;
+    char line[4096];
+    size_t n;
+
+    /* Live: setting feature bit 0x80 logs the next 2000 particle dispatches. */
+    if (!(vkd3d_bench_features() & VKD3D_BENCH_FEATURE_PARTICLE_DIAG))
+    {
+        armed = 0;
+        return;
+    }
+    if (!armed)
+    {
+        armed = 1;
+        limit = 2000;
+    }
+    if (limit <= 0 || !rs || !views || !vkd3d_particle_shader(hash))
+        return;
+    limit--;
+    if (hash == VKD3D_PARTICLE_SIMULATE)
+        sims++;
+    for (p = 0; p < rs->parameter_count; p++)
+    {
+        if (rs->parameters[p].parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+            continue;
+        base = list->compute_bindings.descriptor_tables[p];
+        n = snprintf(line, sizeof(line), "pdiag sim %u hash %016"PRIx64" param %u base %u:", sims, hash, p, base);
+        for (b = 0; b < rs->parameters[p].descriptor_table.binding_count && n < sizeof(line) - 128; b++)
+        {
+            bind = &rs->parameters[p].descriptor_table.first_binding[b];
+            if (bind->type != VKD3D_SHADER_DESCRIPTOR_TYPE_SRV && bind->type != VKD3D_SHADER_DESCRIPTOR_TYPE_UAV)
+                continue;
+            count = min(bind->register_count, 12u);
+            for (k = 0; k < count && n < sizeof(line) - 128; k++)
+            {
+                idx = base + bind->descriptor_offset + k;
+                n += snprintf(line + n, sizeof(line) - n, " %c%u@%u=%"PRIx64"+%x/f%u/%x",
+                        bind->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SRV ? 't' : 'u', bind->register_index + k, idx,
+                        (uint64_t)views[idx].info.buffer.va, views[idx].info.buffer.range,
+                        views[idx].info.buffer.dxgi_format, views[idx].info.flags);
+            }
+        }
+        INFO("%s\n", line);
+    }
+}
+
+/* Before a dispatch (is_copy false) or a buffer copy: puts list->cmd.vk_command_buffer where the
+ * command belongs (a phase of the open batch, or the list itself). */
+static void d3d12_command_list_particle_before_op(struct d3d12_command_list *list, bool is_copy, bool copy_ok)
+{
+    struct vkd3d_particle_batch *b = &list->particle;
+    unsigned int k = vkd3d_particle_batch_size();
+    uint64_t hash = is_copy ? 0 : d3d12_command_list_compute_hash(list);
+
+    if (!is_copy)
+        d3d12_command_list_particle_diag(list, hash);
+
+    if (!k)
+    {
+        d3d12_command_list_particle_splice(list);
+        b->index = 0;
+        return;
+    }
+
+    if (hash == VKD3D_PARTICLE_SIMULATE)
+    {
+        if (b->real_vtbl && b->systems == k)
+            d3d12_command_list_particle_splice(list);
+        b->index = 0;
+        if (!b->real_vtbl && !d3d12_command_list_particle_begin(list))
+            return;
+        b->index = b->systems++;
+        vkd3d_particle_sims++;
+        b->step = 0;
+        b->pending_step = false;
+    }
+    else if (!is_copy && b->index && !b->real_vtbl && vkd3d_particle_shader(hash))
+    {
+        /* The rest of a system whose batch had to close early: it keeps its own buffers. */
+        if (!d3d12_command_list_particle_rename(list, hash, b->index))
+            vkd3d_particle_batch_k = 0;
+        return;
+    }
+    else if (!b->real_vtbl)
+        return;
+    else if (!b->systems || !(is_copy ? copy_ok : vkd3d_particle_shader(hash)))
+    {
+        d3d12_command_list_particle_splice(list);
+        if (!is_copy)
+            b->index = 0;
+        return;
+    }
+    else if (b->pending_step)
+    {
+        b->step++;
+        b->pending_step = false;
+    }
+
+    if (!is_copy && !d3d12_command_list_particle_rename(list, hash, b->index))
+    {
+        /* Not provably exact: back to the engine's own order, for good. */
+        vkd3d_particle_batch_k = 0;
+        d3d12_command_list_particle_splice(list);
+        return;
+    }
+    if (b->step >= VKD3D_PARTICLE_MAX_PHASES)
+    {
+        d3d12_command_list_particle_splice(list);
+        return;
+    }
+    while (b->phase_count <= b->step)
+    {
+        if (!(b->phases[b->phase_count] = d3d12_command_list_particle_secondary(list)))
+        {
+            d3d12_command_list_particle_splice(list);
+            return;
+        }
+        b->phase_count++;
+    }
+    d3d12_command_list_end_transfer_batch(list);
+    d3d12_command_list_particle_switch(list, b->phases[b->step]);
+}
+
+/* ResourceBarrier inside an open batch: UAV barriers and buffer transitions only order this
+ * system's next step after its previous one, which the phase barriers do. Returns true if the
+ * barriers were absorbed. */
+static bool d3d12_command_list_particle_barrier(struct d3d12_command_list *list,
+        UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+    struct vkd3d_particle_batch *b = &list->particle;
+    struct d3d12_resource *res;
+    unsigned int i;
+
+    if (!b->real_vtbl)
+        return false;
+    if (!vkd3d_particle_batch_size())
+    {
+        d3d12_command_list_particle_splice(list);
+        return false;
+    }
+    for (i = 0; i < barrier_count; i++)
+    {
+        const D3D12_RESOURCE_BARRIER *bar = &barriers[i];
+
+        if (bar->Flags & (D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY | D3D12_RESOURCE_BARRIER_FLAG_END_ONLY))
+            break;
+        if (bar->Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
+            continue;
+        if (bar->Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+            break;
+        res = impl_from_ID3D12Resource(bar->Transition.pResource);
+        if (!res || !d3d12_resource_is_buffer(res) ||
+                bar->Transition.StateAfter == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT ||
+                bar->Transition.StateBefore == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
+            break;
+    }
+    if (i < barrier_count)
+    {
+        d3d12_command_list_particle_splice(list);
+        return false;
+    }
+    b->pending_step = true;
+    return true;
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_iface *iface,
         UINT x, UINT y, UINT z)
 {
@@ -9494,6 +11112,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
     const VkPhysicalDeviceLimits *limits;
 
     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
+
+    vkd3d_frametrace_count_draw(list);
 
     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
@@ -9533,6 +11153,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
             return;
     }
 
+    d3d12_command_list_particle_before_op(list, false, false);
     d3d12_command_list_end_transfer_batch(list);
 
     if (!d3d12_command_list_update_compute_state(list))
@@ -9543,6 +11164,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
 
     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
 
+    vkd3d_gputime_dispatch_label(list->cmd.vk_command_buffer, list->state->compute.code.meta.hash, x, y, z);
+    vkd3d_gputime_note_stack(list->cmd.vk_command_buffer, "Dispatch");
     if (!list->predication.fallback_enabled)
         VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, x, y, z));
     else
@@ -9569,7 +11192,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
             "src_offset %#"PRIx64", byte_count %#"PRIx64".\n",
             iface, dst, dst_offset, src, src_offset, byte_count);
 
+    if (d3d12_command_list_pdraw_copy(list, impl_from_ID3D12Resource(dst), dst_offset,
+            impl_from_ID3D12Resource(src), src_offset, byte_count))
+        return;
     d3d12_command_list_check_render_pass_validation(list, "CopyBufferRegion called within a render pass.\n", true);
+    d3d12_command_list_particle_before_op(list, true, byte_count <= 4096);
     d3d12_command_list_flush_dgc_batch(list);
 
     list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
@@ -9581,11 +11208,28 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
     src_resource = impl_from_ID3D12Resource(src);
     assert(d3d12_resource_is_buffer(src_resource));
 
+    vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_COPY_SRC, src_resource->res.va + src_offset, byte_count);
+    if (byte_count == 3840 && (vkd3d_bench_features() & VKD3D_BENCH_FEATURE_DRAW_DIAG))
+    {
+        vkd3d_draw_diag_copy_dst = dst_resource->res.va + dst_offset;
+        vkd3d_draw_diag_copy_src = src_resource->res.va + src_offset;
+    }
+    vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_COPY_DST, dst_resource->res.va + dst_offset, byte_count);
+
+    /* idxcache.c only follows CPU writes into the geometry heap. */
+    if (vkd3d_index_cache_is_source(dst_resource->res.vk_buffer))
+        vkd3d_index_cache_disable("CopyBufferRegion writes the geometry heap");
+
     d3d12_command_list_track_resource_usage(list, dst_resource, true);
     d3d12_command_list_track_resource_usage(list, src_resource, true);
 
     d3d12_command_list_end_current_render_pass(list, true);
     d3d12_command_list_end_transfer_batch(list);
+
+    vkd3d_gputime_note(list->cmd.vk_command_buffer, "d3d copy %"PRIu64" B from %p va %#"PRIx64" (+%#"PRIx64", heap type %u) to %p va %#"PRIx64" (+%#"PRIx64", heap type %u)",
+            byte_count, (void *)src_resource, src_resource->res.va, src_offset,
+            src_resource->heap ? src_resource->heap->desc.Properties.Type : 0, (void *)dst_resource, dst_resource->res.va, dst_offset,
+            dst_resource->heap ? dst_resource->heap->desc.Properties.Type : 0);
 
     buffer_copy.sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
     buffer_copy.pNext = NULL;
@@ -10011,6 +11655,28 @@ static void d3d12_command_list_copy_image_barrier_flags(struct d3d12_command_lis
     }
 }
 
+/* miles-bench, VKD3D_BENCH_COPY_NO_DISCARD: a copy that overwrites a whole subresource normally
+ * discards it first (oldLayout UNDEFINED). On NVIDIA that discard costs milliseconds for images in
+ * system memory (Miles Morales re-uploads 1920x1088 and 960x544 A8 textures in a CUSTOM L0 heap
+ * that way: 1-10 ms of GPU time per upload). Keeping the contents (transition from the image's
+ * current layout) gives the same image after the copy. 1 = images in system memory, 2 = all. */
+static bool d3d12_command_list_copy_keeps_contents(struct d3d12_command_list *list, struct d3d12_resource *dst)
+{
+    const struct vkd3d_memory_allocation *mem;
+    uint32_t type, features;
+
+    /* Set from the environment at the first device creation, switchable live (bench/abf.py). */
+    features = vkd3d_bench_features();
+    if (!(features & (VKD3D_BENCH_FEATURE_COPY_KEEP_SYSMEM | VKD3D_BENCH_FEATURE_COPY_KEEP_ALL)))
+        return false;
+    if (features & VKD3D_BENCH_FEATURE_COPY_KEEP_ALL)
+        return true;
+    mem = dst->heap ? &dst->heap->allocation : &dst->mem;
+    type = mem->device_allocation.vk_memory_type;
+    return type < list->device->memory_properties.memoryTypeCount &&
+            !(list->device->memory_properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
 static void d3d12_command_list_copy_image_transition_images(struct d3d12_command_list *list,
         struct d3d12_command_list_barrier_batch *batch,
         struct d3d12_resource *dst_resource, const struct vkd3d_format *dst_format,
@@ -10032,6 +11698,9 @@ static void d3d12_command_list_copy_image_transition_images(struct d3d12_command
     dst_copy_pass_access = barrier.dst.access;
     if (overlapping_subresource)
         dst_copy_pass_access |= barrier.src.access;
+
+    if (writes_full_subresource && d3d12_command_list_copy_keeps_contents(list, dst_resource))
+        writes_full_subresource = false;
 
     /* With unified layout, only have to care if we need to discard the image.
      * If we have to add non-transfer reads due to fallback copies, that warrants a barrier as well.
@@ -10108,6 +11777,21 @@ static void d3d12_command_list_copy_image(struct d3d12_command_list *list,
         dst_resource, dst_format,
         src_resource, src_format,
         region, overlapping_subresource);
+
+    /* miles-bench: which images get copied, and where they live (vk memory type, 7 = VRAM). */
+    vkd3d_gputime_note(list->cmd.vk_command_buffer,
+            "d3d image copy %s to %p %"PRIu64"x%u fmt %u mips %u flags %#x memtype %u heap type %u (layout %u -> %u) "
+            "from %p %"PRIu64"x%u fmt %u memtype %u (layout %u)",
+            barrier.use_copy ? "vkCmdCopyImage" : "render pass",
+            (void *)dst_resource, dst_resource->desc.Width, dst_resource->desc.Height, dst_resource->desc.Format,
+            dst_resource->desc.MipLevels, dst_resource->desc.Flags,
+            (dst_resource->heap ? &dst_resource->heap->allocation : &dst_resource->mem)->device_allocation.vk_memory_type,
+            dst_resource->heap ? dst_resource->heap->desc.Properties.Type : dst_resource->heap_properties.Type,
+            dst_resource->common_layout, barrier.dst.layout,
+            (void *)src_resource, src_resource->desc.Width, src_resource->desc.Height, src_resource->desc.Format,
+            (src_resource->heap ? &src_resource->heap->allocation : &src_resource->mem)->device_allocation.vk_memory_type,
+            barrier.src.layout);
+    vkd3d_gputime_note_stack(list->cmd.vk_command_buffer, "image copy");
 
     VKD3D_BREADCRUMB_TAG("Image -> Image");
     VKD3D_BREADCRUMB_RESOURCE(src_resource);
@@ -10729,19 +12413,22 @@ static void d3d12_command_list_before_copy_texture_region(struct d3d12_command_l
     }
     else if (info->batch_type == VKD3D_BATCH_TYPE_COPY_BUFFER_TO_IMAGE)
     {
-        d3d12_command_list_track_resource_usage(list, dst_resource, !info->writes_full_resource);
+        bool keep = d3d12_command_list_copy_keeps_contents(list, dst_resource);
+
+        d3d12_command_list_track_resource_usage(list, dst_resource, keep || !info->writes_full_resource);
 
         if (!unified || info->writes_full_subresource)
         {
             d3d12_command_list_transition_image_layout(list, batch, dst_resource->res.vk_image,
                     &info->copy.buffer_image.imageSubresource, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_NONE,
-                    info->writes_full_subresource ? VK_IMAGE_LAYOUT_UNDEFINED : dst_resource->common_layout,
+                    info->writes_full_subresource && !keep ? VK_IMAGE_LAYOUT_UNDEFINED : dst_resource->common_layout,
                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, info->dst_layout);
         }
     }
     else if (info->batch_type == VKD3D_BATCH_TYPE_COPY_IMAGE)
     {
-        d3d12_command_list_track_resource_usage(list, dst_resource, !info->writes_full_resource);
+        d3d12_command_list_track_resource_usage(list, dst_resource,
+                d3d12_command_list_copy_keeps_contents(list, dst_resource) || !info->writes_full_resource);
 
         if (!unified || info->writes_full_subresource || info->dst_format->vk_aspect_mask != info->src_format->vk_aspect_mask)
         {
@@ -10879,6 +12566,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
+    if (vkd3d_frametrace_watching)
+    {
+        if (src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+            vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_COPY_SRC,
+                    impl_from_ID3D12Resource(src->pResource)->res.va + src->PlacedFootprint.Offset,
+                    (VkDeviceSize)src->PlacedFootprint.Footprint.RowPitch * src->PlacedFootprint.Footprint.Height *
+                    src->PlacedFootprint.Footprint.Depth);
+        if (dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+            vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_COPY_DST,
+                    impl_from_ID3D12Resource(dst->pResource)->res.va + dst->PlacedFootprint.Offset,
+                    (VkDeviceSize)dst->PlacedFootprint.Footprint.RowPitch * dst->PlacedFootprint.Footprint.Height *
+                    dst->PlacedFootprint.Footprint.Depth);
+    }
+
     if (src_box && !validate_d3d12_box(src_box))
     {
         WARN("Empty box %s.\n", debug_d3d12_box(src_box));
@@ -10887,6 +12588,26 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
 
     if (!d3d12_command_list_init_copy_texture_region(list, dst, dst_x, dst_y, dst_z, src, src_box, &copy_info))
         return;
+
+    /* miles-bench: texture <-> buffer/texture copies and where both ends live (vk memory type, 7 = VRAM). */
+    {
+        struct d3d12_resource *d = impl_from_ID3D12Resource(dst->pResource);
+        struct d3d12_resource *r = impl_from_ID3D12Resource(src->pResource);
+
+        vkd3d_gputime_note(list->cmd.vk_command_buffer,
+                "d3d CopyTextureRegion batch %u to %p %s %"PRIu64"x%u fmt %u memtype %u heap type %u "
+                "from %p %s %"PRIu64"x%u fmt %u memtype %u heap type %u box %s",
+                copy_info.batch_type, (void *)d, dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? "buffer" : "tex",
+                d->desc.Width, d->desc.Height, d->desc.Format,
+                (d->heap ? &d->heap->allocation : &d->mem)->device_allocation.vk_memory_type,
+                d->heap ? d->heap->desc.Properties.Type : d->heap_properties.Type,
+                (void *)r, src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? "buffer" : "tex",
+                r->desc.Width, r->desc.Height, r->desc.Format,
+                (r->heap ? &r->heap->allocation : &r->mem)->device_allocation.vk_memory_type,
+                r->heap ? r->heap->desc.Properties.Type : r->heap_properties.Type,
+                src_box ? debug_d3d12_box(src_box) : "none");
+        vkd3d_gputime_note_stack(list->cmd.vk_command_buffer, "CopyTextureRegion");
+    }
 
     d3d12_command_list_ensure_transfer_batch(list, copy_info.batch_type);
 
@@ -10984,6 +12705,22 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
 
     dst_resource = impl_from_ID3D12Resource(dst);
     src_resource = impl_from_ID3D12Resource(src);
+
+    /* miles-bench: what gets copied whole, and where it lives (vk memory type, 7 = VRAM). */
+    vkd3d_gputime_note(list->cmd.vk_command_buffer,
+            "d3d CopyResource to %p dim %u %"PRIu64"x%ux%u fmt %u mips %u flags %#x memtype %u heap type %u layout %u "
+            "from %p dim %u %"PRIu64"x%ux%u fmt %u memtype %u layout %u",
+            (void *)dst_resource, dst_resource->desc.Dimension, dst_resource->desc.Width, dst_resource->desc.Height,
+            dst_resource->desc.DepthOrArraySize, dst_resource->desc.Format, dst_resource->desc.MipLevels,
+            dst_resource->desc.Flags,
+            (dst_resource->heap ? &dst_resource->heap->allocation : &dst_resource->mem)->device_allocation.vk_memory_type,
+            dst_resource->heap ? dst_resource->heap->desc.Properties.Type : dst_resource->heap_properties.Type,
+            dst_resource->common_layout,
+            (void *)src_resource, src_resource->desc.Dimension, src_resource->desc.Width, src_resource->desc.Height,
+            src_resource->desc.DepthOrArraySize, src_resource->desc.Format,
+            (src_resource->heap ? &src_resource->heap->allocation : &src_resource->mem)->device_allocation.vk_memory_type,
+            src_resource->common_layout);
+    vkd3d_gputime_note_stack(list->cmd.vk_command_buffer, "CopyResource");
 
     if (list->type == D3D12_COMMAND_LIST_TYPE_COPY)
     {
@@ -12528,6 +14265,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_RSSetViewports(d3d12_command_li
             vk_viewport->height = 0.0f;
         }
     }
+    if (viewport_count)
+        vkd3d_frametrace_viewport(viewports[0].Width, viewports[0].Height);
 
     if (dyn_state->viewport_count != viewport_count)
     {
@@ -13554,12 +15293,56 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
 
     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
 
+    /* miles-bench EXPERIMENT ONLY (lossy, live feature bit 0x20): drop the UAV barriers
+     * that follow the particle loop's dispatches (662c simulate, e3b454 args, b15604 prepare), to
+     * measure how much of the loop's GPU time is serialization. Races; never for play. */
+    {
+        uint64_t h;
+
+        if ((vkd3d_bench_features() & VKD3D_BENCH_FEATURE_PARTICLE_NOBARRIER) && barrier_count == 1 && barriers[0].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV &&
+                d3d12_pipeline_state_is_compute(list->state))
+        {
+            h = list->state->compute.code.meta.hash;
+            if (h == 0x662c25e757553f79ull || h == 0xe3b454ffb034d091ull || h == 0xb15604df3ab336acull)
+                return;
+        }
+    }
+
+    if (d3d12_command_list_particle_barrier(list, barrier_count, barriers))
+        return;
+    if (d3d12_command_list_pdraw_barrier(list, barrier_count, barriers))
+        return;
+
     d3d12_command_list_flush_dgc_batch(list);
     d3d12_command_list_end_current_render_pass(list, false);
     d3d12_command_list_end_transfer_batch(list);
     d3d12_command_list_barrier_batch_init(&batch);
 
     d3d12_command_list_debug_mark_begin_region(list, "ResourceBarrier");
+
+    if (vkd3d_gputime_tracking(list->cmd.vk_command_buffer))
+    {
+        for (i = 0; i < barrier_count; ++i)
+        {
+            const D3D12_RESOURCE_BARRIER *b = &barriers[i];
+            const struct d3d12_resource *res = NULL;
+
+            if (b->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+                res = impl_from_ID3D12Resource(b->Transition.pResource);
+            else if (b->Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
+                res = impl_from_ID3D12Resource(b->UAV.pResource);
+            else
+                res = impl_from_ID3D12Resource(b->Aliasing.pResourceAfter);
+            vkd3d_gputime_note(list->cmd.vk_command_buffer, "d3d barrier %u/%u %s flags %#x res %p %s %"PRIu64"x%u va %#"PRIx64" %#x -> %#x sub %#x",
+                    i + 1, barrier_count, b->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? "transition" :
+                    b->Type == D3D12_RESOURCE_BARRIER_TYPE_UAV ? "uav" : "aliasing", b->Flags, (void *)res,
+                    res ? (d3d12_resource_is_buffer(res) ? "buf" : "tex") : "-", res ? (uint64_t)res->desc.Width : 0,
+                    res ? res->desc.Height : 0, res && d3d12_resource_is_buffer(res) ? (uint64_t)res->res.va : 0,
+                    b->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? b->Transition.StateBefore : 0,
+                    b->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? b->Transition.StateAfter : 0,
+                    b->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? b->Transition.Subresource : 0);
+        }
+    }
 
     /* Barriers inside render passes are allowed for timetraveling barrier reasons ... */
     d3d12_command_list_check_render_pass_validation(list, NULL, true);
@@ -13953,14 +15736,28 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
 
         if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         {
-            list->descriptor_heap.buffers.db.heap_va_resource = heap->descriptor_buffer.va;
-            list->descriptor_heap.buffers.db.vk_buffer_resource = heap->descriptor_buffer.vk_buffer;
+            if (heap->bench_lazy)
+            {
+                if (d3d12_descriptor_heap_bind_buffer(heap, &list->descriptor_heap.buffers.db.heap_va_resource,
+                        &list->descriptor_heap.buffers.db.vk_buffer_resource))
+                {
+                    for (j = 0; j < list->bench_borrowed_bound_count && list->bench_borrowed_bound[j] != heap; j++)
+                        ;
+                    if (j == list->bench_borrowed_bound_count && j < ARRAY_SIZE(list->bench_borrowed_bound))
+                        list->bench_borrowed_bound[list->bench_borrowed_bound_count++] = heap;
+                }
+            }
+            else
+            {
+                list->descriptor_heap.buffers.db.heap_va_resource = heap->descriptor_buffer.va;
+                list->descriptor_heap.buffers.db.vk_buffer_resource = heap->descriptor_buffer.vk_buffer;
+            }
             list->descriptor_heap.buffers.resource.heap = heap;
 
             if (!d3d12_device_use_embedded_mutable_descriptors(list->device))
             {
                 /* In case we need to hoist buffer descriptors. */
-                d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+                d = d3d12_desc_decode_va_raw(heap->cpu_va.ptr);
                 list->cbv_srv_uav_descriptors_view = d.view;
             }
         }
@@ -14014,7 +15811,7 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
         if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         {
             struct d3d12_desc_split d;
-            d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+            d = d3d12_desc_decode_va_raw(heap->cpu_va.ptr);
             list->cbv_srv_uav_descriptors_view = d.view;
         }
     }
@@ -14038,7 +15835,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_comman
     {
         struct d3d12_descriptor_heap *heap = impl_from_ID3D12DescriptorHeap(heaps[i]);
         if (heap)
+        {
             d3d12_command_allocator_retain_descriptor_heap(list->allocator, heap);
+            vkd3d_frametrace_bind_heap(heap);
+        }
     }
 
     if (d3d12_device_use_descriptor_heap(list->device))
@@ -14060,6 +15860,10 @@ static void d3d12_command_list_set_root_signature(struct d3d12_command_list *lis
 
     if (root_signature)
         bindings->static_sampler_set = root_signature->vk_sampler_set;
+    /* miles-bench lazy heaps: shaders of this root signature may index the heap without tables. */
+    if (VKD3D_EXPECT_FALSE(list->bench_borrowed_bound_count) && root_signature &&
+            (root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED))
+        list->bench_borrowed_tables = true;
 
     d3d12_command_list_invalidate_root_parameters(list, bindings, true, NULL);
 }
@@ -14140,6 +15944,12 @@ static inline void d3d12_command_list_set_descriptor_table_embedded(struct d3d12
 
     bindings->descriptor_tables[index] = d3d12_desc_heap_offset_from_embedded_gpu_handle(
             base_descriptor, cbv_srv_uav_size_log2, sampler_size_log2);
+    if (VKD3D_EXPECT_FALSE(list->bench_borrowed_bound_count) &&
+            !(root_signature && index < root_signature->parameter_count &&
+            root_signature->parameters[index].parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+            root_signature->parameters[index].descriptor_table.binding_count &&
+            root_signature->parameters[index].descriptor_table.first_binding[0].type == VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER))
+        list->bench_borrowed_tables = true;
 
     if (root_signature)
     {
@@ -14178,6 +15988,12 @@ static inline void d3d12_command_list_set_descriptor_table(struct d3d12_command_
 
     assert(index < ARRAY_SIZE(bindings->descriptor_tables));
     bindings->descriptor_tables[index] = d3d12_desc_heap_offset_from_gpu_handle(base_descriptor);
+    if (VKD3D_EXPECT_FALSE(list->bench_borrowed_bound_count) &&
+            !(root_signature && index < root_signature->parameter_count &&
+            root_signature->parameters[index].parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+            root_signature->parameters[index].descriptor_table.binding_count &&
+            root_signature->parameters[index].descriptor_table.first_binding[0].type == VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER))
+        list->bench_borrowed_tables = true;
 
     if (root_signature)
     {
@@ -14419,6 +16235,8 @@ static void d3d12_command_list_set_root_descriptor(struct d3d12_command_list *li
 {
     struct vkd3d_root_descriptor_info *descriptor = &bindings->root_descriptors[index];
 
+    vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_ROOT, gpu_address, 0);
+
     if (bindings->root_signature->root_descriptor_raw_va_mask & (1ull << index))
         d3d12_command_list_set_root_descriptor_va(list, descriptor, gpu_address);
     else
@@ -14513,7 +16331,16 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
 
     TRACE("iface %p, view %p.\n", iface, view);
 
+    if (view)
+        d3d12_command_list_pdraw_check_va(list, view->BufferLocation, view->SizeInBytes);
     list->index_buffer.is_dirty = true;
+    list->index_buffer_cacheable = false;
+
+    if (view)
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_IB, view->BufferLocation, view->SizeInBytes);
+    list->frametrace.ib_va = view ? view->BufferLocation : 0;
+    list->frametrace.ib_size = view ? view->SizeInBytes : 0;
+    list->frametrace.ib_32 = view && view->Format == DXGI_FORMAT_R32_UINT;
 
     if (!view || view->SizeInBytes == 0)
     {
@@ -14548,6 +16375,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
             list->index_buffer.buffer = resource->vk_buffer;
             list->index_buffer.offset = view->BufferLocation - resource->va;
             list->index_buffer.size = view->SizeInBytes;
+            list->index_buffer_cacheable = vkd3d_index_cache_is_source(resource->vk_buffer);
         }
         else
         {
@@ -14595,6 +16423,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
         VkDeviceSize offset;
         VkDeviceSize size;
         uint32_t stride;
+
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_VB, views[i].BufferLocation, views[i].SizeInBytes);
+        d3d12_command_list_pdraw_check_va(list, views[i].BufferLocation, views[i].SizeInBytes);
+        list->frametrace.vb_va[start_slot + i] = views[i].BufferLocation;
+        list->frametrace.vb_size[start_slot + i] = views[i].SizeInBytes;
+        list->frametrace.vb_stride[start_slot + i] = views[i].StrideInBytes;
 
         if (views[i].BufferLocation)
         {
@@ -17087,11 +18921,18 @@ static char *decode_pix_string(UINT metadata, const void *data, size_t size)
     return label_str;
 }
 
+char *vkd3d_decode_pix_string(UINT metadata, const void *data, size_t size)
+{
+    return decode_pix_string(metadata, data, size);
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_SetMarker(d3d12_command_list_iface *iface,
         UINT metadata, const void *data, UINT size)
 {
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     char *label_str;
+
+    vkd3d_frametrace_marker(metadata, data, size);
 
     if (!list->device->vk_info.EXT_debug_utils)
         return;
@@ -17118,6 +18959,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_BeginEvent(d3d12_command_list_i
 
     TRACE("iface %p, metadata %u, data %p, size %u.\n",
           iface, metadata, data, size);
+
+    vkd3d_frametrace_marker(metadata, data, size);
 
     if (!list->device->vk_info.EXT_debug_utils)
         return;
@@ -17805,6 +19648,22 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
             iface, command_signature, max_command_count, arg_buffer, arg_buffer_offset,
             count_buffer, count_buffer_offset);
 
+    vkd3d_frametrace_count_draw(list);
+    if (sig_impl->desc.NumArgumentDescs && sig_impl->desc.pArgumentDescs[sig_impl->desc.NumArgumentDescs - 1].Type <=
+            D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
+        d3d12_command_list_draw_diag(list, "indirect");
+    d3d12_command_list_pdraw_restore(list);
+    if (list->pdraw.real_vtbl)
+    {
+        d3d12_command_list_pdraw_check_va(list, arg_impl->res.va + arg_buffer_offset, 1ull << 20);
+        if (count_impl)
+            d3d12_command_list_pdraw_check_va(list, count_impl->res.va + count_buffer_offset, 4);
+        if (sig_impl->desc.NumArgumentDescs == 1 && sig_impl->desc.pArgumentDescs[0].Type <= D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
+            d3d12_command_list_pdraw_draw(list);
+        else
+            d3d12_command_list_pdraw_flush(list);
+    }
+
     if (!max_command_count)
         return;
 
@@ -17816,9 +19675,26 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
 
     last_arg_desc = &signature_desc->pArgumentDescs[signature_desc->NumArgumentDescs - 1];
 
+    if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH && signature_desc->NumArgumentDescs == 1 &&
+            !sig_impl->requires_state_template && !count_buffer)
+        d3d12_command_list_particle_before_op(list, false, false);
+    else
+        d3d12_command_list_particle_splice(list);
+
     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH * max_command_count;
 
+    vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_INDIRECT, arg_impl->res.va + arg_buffer_offset,
+            (VkDeviceSize)max_command_count * signature_desc->ByteStride);
+    if (count_impl)
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_INDIRECT, count_impl->res.va + count_buffer_offset, 4);
+    if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && list->frametrace.ib_va)
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_INDIRECT_DRAW, list->frametrace.ib_va, 0);
+
     unrolled_stride = signature_desc->ByteStride;
+
+    vkd3d_gputime_note(list->cmd.vk_command_buffer, "d3d ExecuteIndirect type %u args %u stride %u template %u max %u arg %p va %#"PRIx64" +%#"PRIx64" count %p",
+            last_arg_desc->Type, signature_desc->NumArgumentDescs, signature_desc->ByteStride, sig_impl->requires_state_template,
+            max_command_count, (void *)arg_impl, arg_impl->res.va, arg_buffer_offset, (void *)count_impl);
 
     VKD3D_BREADCRUMB_TAG("ExecuteIndirect [MaxCommandCount, ArgBuffer cookie, ArgBuffer offset, Count cookie, Count offset]");
     VKD3D_BREADCRUMB_AUX32(max_command_count);
@@ -17996,6 +19872,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
 
             /* Without state changes, we can always just unroll the dispatches.
              * Not the most useful feature ever, but it has to work. */
+            vkd3d_gputime_dispatch_label(list->cmd.vk_command_buffer, list->state->compute.code.meta.hash, 0, 0, max_command_count);
+            vkd3d_gputime_note_stack(list->cmd.vk_command_buffer, "ExecuteIndirect dispatch");
             for (i = 0; i < max_command_count; i++)
             {
                 VK_CALL(vkCmdDispatchIndirect(list->cmd.vk_command_buffer, scratch.buffer, scratch.offset));
@@ -22880,6 +24758,11 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     if (!command_list_count)
         return;
 
+    vkd3d_geomirror_sync(command_queue->device);
+    vkd3d_index_cache_flush(command_queue->device);
+    vkd3d_lightgrid_update();
+    vkd3d_skinbuf_update();
+
     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
     {
         d3d12_device_mark_as_removed(command_queue->device, hr,
@@ -22916,6 +24799,31 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         {
             WARN("Unsupported command list type %p.\n", cmd_list);
             return;
+        }
+
+        if (cmd_list->pdraw.check_count)
+            d3d12_command_list_pdraw_verify(cmd_list);
+        if (cmd_list->bench_borrowed_bound_count)
+        {
+            /* miles-bench lazy heaps: a list that bound a heap while it shared the null heap reads the
+             * null heap; if the heap got its own memory (a descriptor write) since, the write is
+             * not visible to it. Counted; none expected. */
+            static unsigned int lazy_lists, lazy_stale;
+            unsigned int k;
+
+            lazy_lists++;
+            for (k = 0; k < cmd_list->bench_borrowed_bound_count; k++)
+            {
+                if (!__atomic_load_n(&cmd_list->bench_borrowed_bound[k]->bench_borrowed, __ATOMIC_ACQUIRE) &&
+                        ++lazy_stale <= 20)
+                    ERR("bench: lazy heaps: list %p bound heap %p before its first write and is submitted after it "
+                            "(%u of %u such lists); descriptor tables set after the bind: %s.\n", (void *)cmd_list,
+                            (void *)cmd_list->bench_borrowed_bound[k], lazy_stale, lazy_lists,
+                            cmd_list->bench_borrowed_tables ? "yes" : "no");
+            }
+            if (!(lazy_lists & (lazy_lists - 1)))
+                INFO("bench: lazy heaps: %u submitted lists bound a shared heap, %u of them after its first write.\n",
+                        lazy_lists, lazy_stale);
         }
 
 #ifdef VKD3D_ENABLE_PROFILING

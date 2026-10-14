@@ -588,6 +588,54 @@ static HRESULT d3d12_root_signature_info_from_desc(struct d3d12_root_signature_i
     }
 
     info->parameter_count = desc->NumParameters + info->hoist_descriptor_count;
+
+    /* miles-bench: what the game's root signatures look like (first 64). */
+    {
+        static unsigned int logged;
+        unsigned int tables = 0, root_cbv = 0, root_srv_uav = 0, consts = 0, cbv_ranges = 0, cbv_single = 0;
+        unsigned int cbv_volatile = 0, cbv_static_flag = 0, srv_uav_ranges = 0, unbounded = 0, const_dwords = 0;
+
+        if (!local_root_signature && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 64)
+        {
+            for (i = 0; i < desc->NumParameters; ++i)
+            {
+                const D3D12_ROOT_PARAMETER1 *p = &desc->pParameters[i];
+
+                if (p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                {
+                    tables++;
+                    for (j = 0; j < p->DescriptorTable.NumDescriptorRanges; ++j)
+                    {
+                        const D3D12_DESCRIPTOR_RANGE1 *r = &p->DescriptorTable.pDescriptorRanges[j];
+
+                        if (r->NumDescriptors == UINT_MAX)
+                            unbounded++;
+                        if (r->RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV)
+                        {
+                            cbv_ranges++;
+                            cbv_single += r->NumDescriptors == 1;
+                            cbv_volatile += !!(r->Flags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
+                            cbv_static_flag += !!(r->Flags & D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+                        }
+                        else if (r->RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+                            srv_uav_ranges++;
+                    }
+                }
+                else if (p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV)
+                    root_cbv++;
+                else if (p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                    consts++, const_dwords += p->Constants.Num32BitValues;
+                else
+                    root_srv_uav++;
+            }
+            INFO("rootsig: flags %#x params %u: tables %u (cbv ranges %u, single %u, volatile %u, data-static %u; "
+                    "srv/uav ranges %u, unbounded %u), root cbv %u, root srv/uav %u, constants %u (%u dwords), "
+                    "static samplers %u; hoisted %u, push descriptors %u, cost %u.\n",
+                    desc->Flags, desc->NumParameters, tables, cbv_ranges, cbv_single, cbv_volatile, cbv_static_flag,
+                    srv_uav_ranges, unbounded, root_cbv, root_srv_uav, consts, const_dwords,
+                    desc->NumStaticSamplers, info->hoist_descriptor_count, info->push_descriptor_count, info->cost);
+        }
+    }
     return S_OK;
 }
 
@@ -3488,6 +3536,17 @@ static void vkd3d_report_pipeline_creation_feedback_results(const VkPipelineCrea
     }
 }
 
+/* miles-bench: pipeline compiles that take a while, on the frame trace's clock (which thread, how
+ * long, which PSO), to tell shader-compile stalls from everything else. */
+static void vkd3d_bench_pso_event(const char *kind, uint64_t t0, struct d3d12_pipeline_state *state, VkResult vr)
+{
+    uint64_t ns = vkd3d_get_current_time_ns() - t0;
+
+    if (ns >= 2000000)
+        vkd3d_frametrace_event("pso %s %.3f ms vr %d pso %016"PRIx64" tid %04x", kind, ns / 1e6, vr,
+                vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), (unsigned int)GetCurrentThreadId());
+}
+
 static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
         struct d3d12_device *device,
         const D3D12_SHADER_BYTECODE *code)
@@ -3504,6 +3563,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     VkPipelineCreationFeedbackEXT feedback;
     struct vkd3d_shader_code *spirv_code;
     VkPipelineCache vk_cache;
+    uint64_t pso_t0;
     VkResult vr;
     HRESULT hr;
 
@@ -3583,8 +3643,10 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     if (flags2.flags)
         vk_prepend_struct(&pipeline_info, &flags2);
 
+    pso_t0 = vkd3d_get_current_time_ns();
     vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
             vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+    vkd3d_bench_pso_event("compute", pso_t0, state, vr);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -3641,8 +3703,10 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
 
+        pso_t0 = vkd3d_get_current_time_ns();
         vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
                 vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+        vkd3d_bench_pso_event("compute fallback", pso_t0, state, vr);
 
         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
         {
@@ -6729,6 +6793,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     VkPipelineCreateFlags2CreateInfo flags2;
     VkPipeline vk_libraries[3];
     uint32_t library_count = 0;
+    uint64_t pso_t0;
     VkResult vr;
 
     vk_libraries[library_count++] = graphics->library;
@@ -6782,8 +6847,10 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     if (flags2.flags)
         vk_prepend_struct(&create_info, &flags2);
 
+    pso_t0 = vkd3d_get_current_time_ns();
     vr = VK_CALL(vkCreateGraphicsPipelines(state->device->vk_device,
             vk_cache, 1, &create_info, NULL, vk_pipeline));
+    vkd3d_bench_pso_event("graphics link", pso_t0, state, vr);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -6827,6 +6894,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     uint32_t stages_module_dup_mask = 0;
     VkPipeline vk_pipeline;
     unsigned int i;
+    uint64_t pso_t0;
     VkResult vr;
     HRESULT hr;
 
@@ -6997,7 +7065,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     if (flags2.flags)
         vk_prepend_struct(&pipeline_desc, &flags2);
 
+    pso_t0 = vkd3d_get_current_time_ns();
     vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+    vkd3d_bench_pso_event(key ? "graphics variant" : "graphics", pso_t0, state, vr);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -7047,7 +7117,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         pipeline_desc.pStages = state->graphics.stages;
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
+        pso_t0 = vkd3d_get_current_time_ns();
         vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+        vkd3d_bench_pso_event(key ? "graphics variant fallback" : "graphics fallback", pso_t0, state, vr);
 
         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
         {
@@ -7155,6 +7227,7 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
     struct d3d12_device *device = state->device;
     struct vkd3d_pipeline_key pipeline_key;
     VkPipeline vk_pipeline;
+    uint64_t late_t0;
 
     assert(d3d12_pipeline_state_is_graphics(state));
 
@@ -7189,8 +7262,14 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
 
     FIXME("Compiling a fallback pipeline late!\n");
 
+    late_t0 = vkd3d_get_current_time_ns();
     vk_pipeline = d3d12_pipeline_state_create_pipeline_variant(state,
             &pipeline_key, dsv_format, VK_NULL_HANDLE, 0, dynamic_state_flags);
+    vkd3d_frametrace_event("pso LATE %.3f ms pso %016"PRIx64" tid %04x dsv %u topology %u samples %u",
+            (vkd3d_get_current_time_ns() - late_t0) / 1e6,
+            vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat),
+            (unsigned int)GetCurrentThreadId(), pipeline_key.dsv_format, pipeline_key.topology,
+            pipeline_key.rasterization_samples);
 
     if (!vk_pipeline)
     {
@@ -7216,6 +7295,10 @@ static uint32_t d3d12_max_descriptor_count_from_heap_type(struct d3d12_device *d
     if (heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
             vkd3d_descriptor_debug_active_descriptor_qa_checks())
         count += VKD3D_DESCRIPTOR_DEBUG_NUM_PAD_DESCRIPTORS;
+    /* miles-bench: room for the particle draws' private descriptors (resource.c, command.c). */
+    if (heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && !d3d12_device_use_embedded_mutable_descriptors(device) &&
+            !d3d12_device_use_descriptor_heap(device))
+        count += vkd3d_pdraw_tail_count();
 
     return count;
 }

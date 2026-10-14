@@ -788,7 +788,11 @@ enum vkd3d_allocation_flag
      * and we do not consume space in the VA map. */
     VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH  = (1u << 6),
     VKD3D_ALLOCATION_FLAG_ALLOW_IMAGE_SUBALLOCATION  = (1u << 7),
+    /* miles-bench: VRAM priority classes (see vkd3d_bench_vram_reserve). */
+    VKD3D_ALLOCATION_FLAG_BENCH_HOT         = (1u << 8),
+    VKD3D_ALLOCATION_FLAG_BENCH_COMMITTED   = (1u << 9),
 };
+#define VKD3D_ALLOCATION_FLAGS_BENCH (VKD3D_ALLOCATION_FLAG_BENCH_HOT | VKD3D_ALLOCATION_FLAG_BENCH_COMMITTED)
 
 #define VKD3D_MEMORY_CHUNK_SIZE (VKD3D_VA_BLOCK_SIZE * 8)
 #define VKD3D_MEMORY_IMAGE_HEAP_SUBALLOCATE_THRESHOLD (8 * 1024 * 1024)
@@ -910,7 +914,8 @@ enum vkd3d_memory_transfer_op
     VKD3D_MEMORY_TRANSFER_OP_CLEAR_ALLOCATION,
     VKD3D_MEMORY_TRANSFER_OP_WRITE_SUBRESOURCE,
     VKD3D_MEMORY_TRANSFER_OP_BUILD_NULL_RTAS,
-    VKD3D_MEMORY_TRANSFER_OP_DEBUG_FILL_ALLOCATION
+    VKD3D_MEMORY_TRANSFER_OP_DEBUG_FILL_ALLOCATION,
+    VKD3D_MEMORY_TRANSFER_OP_COPY_BUFFER, /* geomirror.c */
 };
 
 struct vkd3d_memory_transfer_info
@@ -926,6 +931,11 @@ struct vkd3d_memory_transfer_info
     VkOffset3D offset;
     VkExtent3D extent;
     uint32_t fill_value;
+
+    /* COPY_BUFFER: source; barrier_before orders it after everything recorded earlier. */
+    VkBuffer vk_src_buffer;
+    VkDeviceSize vk_src_offset;
+    bool barrier_before;
 };
 
 struct vkd3d_memory_transfer_tracked_resource
@@ -972,6 +982,66 @@ bool vkd3d_memory_transfer_queue_poll_allocation_idle(struct vkd3d_memory_transf
         const struct vkd3d_memory_allocation *allocation);
 bool vkd3d_memory_transfer_queue_clear_in_flight(struct vkd3d_memory_transfer_queue *queue,
         const struct vkd3d_memory_allocation *allocation);
+uint64_t vkd3d_memory_transfer_queue_copy_buffer(struct vkd3d_memory_transfer_queue *queue,
+        VkBuffer src, VkDeviceSize src_offset, VkBuffer dst, VkDeviceSize dst_offset, VkDeviceSize size,
+        bool barrier_before);
+bool vkd3d_memory_transfer_queue_is_done(struct vkd3d_memory_transfer_queue *queue, uint64_t value);
+void vkd3d_memory_transfer_queue_wait_value(struct vkd3d_memory_transfer_queue *queue, uint64_t value);
+
+/* geomirror.c (miles-bench, VKD3D_BENCH_GEOMETRY_VRAM=1) */
+struct d3d12_heap;
+bool vkd3d_geomirror_wanted(const D3D12_HEAP_DESC *desc);
+bool vkd3d_geometry_cached_wanted(const D3D12_HEAP_DESC *desc);
+HRESULT vkd3d_geomirror_register(struct d3d12_device *device, struct d3d12_heap *heap);
+void vkd3d_geomirror_unregister(struct d3d12_heap *heap);
+void vkd3d_geomirror_sync(struct d3d12_device *device);
+void vkd3d_geomirror_note_write(const void *address, uint64_t size);
+void vkd3d_geomirror_hooks_installed(void);
+bool vkd3d_geomirror_hooks_wanted(void);
+void vkd3d_geomirror_take_stats(uint64_t *bytes, uint64_t *runs, uint64_t *syncs, uint64_t *waits,
+        uint64_t *scan_ns);
+bool vkd3d_geomirror_active(void);
+void vkd3d_bench_input_start(uint8_t *image);
+
+/* lightgrid.c (miles-bench, VKD3D_BENCH_LIGHTGRID_SPARSE=1) */
+bool vkd3d_lightgrid_heap_wanted(const D3D12_HEAP_DESC *desc);
+HRESULT vkd3d_lightgrid_create_placed(struct d3d12_device *device, struct d3d12_heap *heap,
+        uint64_t heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+        struct d3d12_resource **resource);
+void vkd3d_lightgrid_update(void);
+void vkd3d_lightgrid_resource_destroyed(struct d3d12_resource *resource);
+uint64_t vkd3d_lightgrid_budget_reserve(void);
+void vkd3d_lightgrid_hook_budget(IUnknown *adapter);
+
+/* skinbuf.c (miles-bench, VKD3D_BENCH_SKIN_SPARSE=1) */
+bool vkd3d_skinbuf_wanted(void);
+bool vkd3d_skinbuf_heap_wanted(const D3D12_HEAP_DESC *desc);
+HRESULT vkd3d_skinbuf_create_placed(struct d3d12_device *device, struct d3d12_heap *heap,
+        uint64_t heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+        struct d3d12_resource **resource);
+void vkd3d_skinbuf_update(void);
+void vkd3d_skinbuf_resource_destroyed(struct d3d12_resource *resource);
+uint64_t vkd3d_skinbuf_budget_reserve(void);
+void vkd3d_skinbuf_log(void);
+void *vkd3d_skinbuf_alloc(void *allocator, int32_t size);
+void *vkd3d_skinbuf_alloc_aligned(void *allocator, int32_t size, int32_t align2);
+void vkd3d_skinbuf_alloc_stub(void);
+void vkd3d_skinbuf_alloc_aligned_stub(void);
+
+/* idxcache.c (miles-bench, VKD3D_BENCH_INDEX_CACHE=1) */
+bool vkd3d_index_cache_wanted(const D3D12_HEAP_DESC *desc);
+void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *heap);
+void vkd3d_index_cache_unregister(struct d3d12_heap *heap);
+bool vkd3d_index_cache_is_source(VkBuffer buffer);
+bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+        VkBuffer *out_buffer, VkDeviceSize *out_offset);
+void vkd3d_index_cache_flush(struct d3d12_device *device);
+void vkd3d_index_cache_present(void);
+bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *full, uint64_t *bytes,
+        uint32_t *used_mib, uint64_t *stale, uint64_t *invalidations, uint64_t *verified, uint64_t *mismatched,
+        uint64_t *scan_steps);
+void vkd3d_index_cache_invalidate_cpu(const void *address, uint64_t size);
+void vkd3d_index_cache_disable(const char *why);
 
 struct vkd3d_memory_allocator
 {
@@ -1031,6 +1101,8 @@ struct d3d12_heap
 
     D3D12_HEAP_DESC desc;
     struct vkd3d_memory_allocation allocation;
+    bool lightgrid; /* lightgrid.c: no memory; the one buffer placed in it is sparse */
+    bool skinbuf;   /* skinbuf.c: likewise for the skinning buffer */
 
     priority_info priority;
 
@@ -1272,6 +1344,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         const D3D12_CLEAR_VALUE *optimized_clear_value,
         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
         struct d3d12_resource **resource);
+void d3d12_resource_wait_for_sparse_init(struct d3d12_resource *resource);
 HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
         const D3D12_CLEAR_VALUE *optimized_clear_value,
@@ -1640,6 +1713,14 @@ struct d3d12_descriptor_heap
     LONG refcount;
     LONG internal_refcount;
 
+    /* miles-bench lazy heaps (resource.c, VKD3D_BENCH_LAZY_HEAPS=1): while bench_borrowed is set the
+     * heap has no memory of its own and shares the device's never-written null heap; its first
+     * descriptor write gives it its own. Kept next to fast_pointer_bank (same cache line). */
+    uint32_t bench_borrowed;
+    uint8_t bench_lazy; /* may be or have been borrowed: binding reads its buffer under the lazy lock */
+    uint8_t bench_null_heap; /* the shared null heap itself: system memory */
+    uint32_t bench_borrowed_binds;
+
     uint64_t gpu_va;
     D3D12_DESCRIPTOR_HEAP_DESC desc;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_va;
@@ -1670,6 +1751,11 @@ struct d3d12_descriptor_heap
 #endif
 
     struct d3d12_null_descriptor_template null_descriptor_template;
+
+    /* miles-bench particle draws (command.c): a shader-visible CBV_SRV_UAV heap gets
+     * VKD3D_PDRAW_TAIL private descriptors after the app's NumDescriptors (tail_base). */
+    uint32_t pdraw_tail_base;
+    uint32_t pdraw_tail_next;
 
     struct d3d12_device *device;
 
@@ -1815,7 +1901,7 @@ static inline void d3d12_desc_copy_embedded_resource_single_32(vkd3d_cpu_descrip
     }
 }
 
-static inline struct d3d12_desc_split d3d12_desc_decode_va(vkd3d_cpu_descriptor_va_t va)
+static inline struct d3d12_desc_split d3d12_desc_decode_va_raw(vkd3d_cpu_descriptor_va_t va)
 {
     uintptr_t num_bits_descriptors;
     struct d3d12_desc_split split;
@@ -1840,6 +1926,20 @@ static inline struct d3d12_desc_split d3d12_desc_decode_va(vkd3d_cpu_descriptor_
     split.view = (struct vkd3d_descriptor_metadata_view *)heap_va;
     split.view += heap_offset;
 
+    return split;
+}
+
+void d3d12_descriptor_heap_materialize(struct d3d12_descriptor_heap *heap);
+bool d3d12_descriptor_heap_bind_buffer(struct d3d12_descriptor_heap *heap, VkDeviceAddress *va, VkBuffer *vk_buffer);
+
+/* Every CPU access to a heap's descriptors decodes its handle here: a lazy heap still sharing the
+ * null heap gets its own memory first (miles-bench, resource.c). Binding uses the raw decode. */
+static inline struct d3d12_desc_split d3d12_desc_decode_va(vkd3d_cpu_descriptor_va_t va)
+{
+    struct d3d12_desc_split split = d3d12_desc_decode_va_raw(va);
+
+    if (VKD3D_EXPECT_FALSE(__atomic_load_n(&split.heap->bench_borrowed, __ATOMIC_ACQUIRE)))
+        d3d12_descriptor_heap_materialize(split.heap);
     return split;
 }
 
@@ -2778,6 +2878,10 @@ struct d3d12_command_allocator
 
     struct d3d12_command_allocator_command_pool primary_pool;
     struct d3d12_command_allocator_command_pool fallback_pool;
+    /* miles-bench: secondary command buffers for particle batching, reset with the allocator. */
+    VkCommandPool particle_pool;
+    VkCommandBuffer *particle_cbs;
+    size_t particle_cbs_size, particle_cb_count, particle_cb_used;
     struct d3d12_command_allocator_scratch_pool scratch_pools[VKD3D_SCRATCH_POOL_KIND_COUNT];
 
     VkExtent3D transfer_granularity;
@@ -3357,6 +3461,51 @@ struct vkd3d_dgc_batch
     size_t draws_count;
 };
 
+/* miles-bench: particle loop batching (command.c, VKD3D_BENCH_PARTICLE_BATCH). */
+#define VKD3D_PARTICLE_MAX_PHASES 32
+struct vkd3d_particle_batch
+{
+    const void *real_vtbl;  /* set while a batch is open (the list's vtable is the guard then) */
+    VkCommandBuffer main_cb;
+    VkCommandBuffer phases[VKD3D_PARTICLE_MAX_PHASES];
+    unsigned int phase_count;
+    unsigned int systems;
+    unsigned int step;
+    bool pending_step;
+    /* Scratch renaming: rename index of the current system, heap entries claimed in this batch. */
+    unsigned int index;
+    unsigned int owned_count;
+    struct { uint32_t index, system; } owned[512];
+};
+
+/* miles-bench: particle draw constants (command.c, VKD3D_BENCH_PDRAW). */
+#define VKD3D_PDRAW_MAX_COPIES 128
+struct vkd3d_pdraw
+{
+    const void *real_vtbl;  /* set while copies are pending (the list's vtable is the guard then) */
+    struct d3d12_resource *target; /* buffer of the pattern in progress */
+    unsigned int phase; /* 0 none, 1 after the transition to COPY_DEST, 2 after the copy, 3 after the transition back */
+    bool flushing;
+    unsigned int copy_count;
+    struct
+    {
+        struct d3d12_resource *dst, *src;
+        uint64_t dst_offset, src_offset, size;
+    } copies[VKD3D_PDRAW_MAX_COPIES];
+    /* Graphics root tables pointed at a private descriptor for the last draw, put back before
+     * anything else reads them. */
+    unsigned int redirect_count;
+    struct { uint32_t param, engine, ours; } redirects[8];
+    /* The engine's descriptors the redirects were made from, compared again at submission
+     * (the game's CBV ranges are volatile). */
+    unsigned int check_count;
+    struct { const struct vkd3d_descriptor_metadata_view *view; VkDeviceAddress va; uint32_t range; } checks[256];
+};
+#define VKD3D_PDRAW_TAIL 4096u
+void d3d12_command_list_pdraw_verify(struct d3d12_command_list *list);
+void vkd3d_bench_heap_scan(void);
+uint32_t vkd3d_pdraw_tail_count(void);
+
 struct d3d12_command_list
 {
     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
@@ -3372,6 +3521,13 @@ struct d3d12_command_list
     bool has_replaced_shaders;
 
     struct vkd3d_index_buffer index_buffer;
+    bool index_buffer_cacheable; /* idxcache.c: the bound IB lives in the geometry heap */
+    struct vkd3d_particle_batch particle;
+    struct vkd3d_pdraw pdraw;
+    /* miles-bench lazy heaps: heaps this list bound while they still shared the null heap. */
+    unsigned int bench_borrowed_bound_count;
+    struct d3d12_descriptor_heap *bench_borrowed_bound[4];
+    bool bench_borrowed_tables; /* a CBV/SRV/UAV table was set after such a bind */
     struct vkd3d_dgc_batch dgc_batch;
 
     struct d3d12_command_list_sequence cmd;
@@ -3506,6 +3662,17 @@ struct d3d12_command_list
         uint32_t dispatch_count;
     } timestamp_profiler;
 #endif
+
+    /* miles-bench frametrace (VKD3D_FRAMETRACE_VA=1): the index/vertex buffers last set. */
+    struct
+    {
+        VkDeviceAddress ib_va;
+        VkDeviceSize ib_size;
+        bool ib_32;
+        VkDeviceAddress vb_va[32];
+        VkDeviceSize vb_size[32];
+        uint32_t vb_stride[32];
+    } frametrace;
 };
 
 HRESULT d3d12_command_list_create(struct d3d12_device *device,
@@ -5972,6 +6139,15 @@ static inline uint32_t vkd3d_bindless_state_find_set_info_index_fast(struct d3d1
         return vkd3d_bindless_state_find_set_info_index(&device->bindless_state, fallback_lookup_types);
 }
 
+bool vkd3d_bench_l0_sysmem(struct d3d12_device *device, const D3D12_HEAP_PROPERTIES *heap_properties);
+VkDeviceSize vkd3d_bench_vram_reserve(const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
+        uint32_t allocation_flags);
+void vkd3d_bench_vram_refused(uint64_t size);
+bool vkd3d_bench_vram_reserve_chunks(void);
+uint32_t vkd3d_bench_sysmem_alloc(struct d3d12_device *device, uint32_t type_bits, VkDeviceSize size,
+        VkDeviceMemory *memory);
+bool vkd3d_bench_upload_in_bar(VkDeviceSize size);
+
 static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_info_domain(
         struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, bool fallback)
@@ -5980,8 +6156,10 @@ static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_inf
      * overlap. Need to select memory types appropriately. */
     if (is_cpu_accessible_heap(heap_properties))
         return &device->memory_info.cpu_accessible_domain;
+    else if (fallback || vkd3d_bench_l0_sysmem(device, heap_properties))
+        return &device->memory_info.fallback_domain;
     else
-        return fallback ? &device->memory_info.fallback_domain : &device->memory_info.non_cpu_accessible_domain;
+        return &device->memory_info.non_cpu_accessible_domain;
 }
 
 static inline HRESULT d3d12_device_query_interface(struct d3d12_device *device, REFIID iid, void **object)
@@ -6179,6 +6357,8 @@ UINT d3d12_determine_shading_rate_image_tile_size(struct d3d12_device *device);
 bool d3d12_device_supports_required_subgroup_size_for_stage(
         struct d3d12_device *device, VkShaderStageFlagBits stage);
 bool d3d12_device_supports_workgraphs(const struct d3d12_device *device);
+
+bool vkd3d_bench_general_layouts(const struct d3d12_device *device);
 
 static inline bool d3d12_device_supports_unified_layouts(const struct d3d12_device *device)
 {
@@ -7167,5 +7347,72 @@ static inline void vkd3d_mapped_memory_range_align(const struct d3d12_device *de
     range->size = align64(range->size, atom_size);
     range->size = min(range->size, size - range->offset);
 }
+
+/* memtrace.c (miles-bench instrumentation, enabled by VKD3D_MEMTRACE=<file>) */
+void vkd3d_memtrace_resource_create(struct d3d12_device *device, struct d3d12_resource *resource, const char *kind);
+void vkd3d_memtrace_resource_destroy(struct d3d12_resource *resource);
+void vkd3d_memtrace_heap_create(struct d3d12_device *device, struct d3d12_heap *heap);
+void vkd3d_memtrace_descriptor_heap_create(struct d3d12_device *device, struct d3d12_descriptor_heap *heap);
+void vkd3d_memtrace_heap_destroy(struct d3d12_heap *heap);
+void vkd3d_memtrace_set_name(const void *object, const WCHAR *name);
+void vkd3d_memtrace_vk_allocate(struct d3d12_device *device, uint32_t vk_type, uint64_t size,
+        bool ok, bool budgeted, VkDeviceMemory vk_memory);
+void vkd3d_memtrace_vk_free(uint32_t vk_type, uint64_t size, VkDeviceMemory vk_memory);
+
+/* enginepatch.c (miles-bench, enabled by VKD3D_ENGINE_PATCH=spin and VKD3D_FRAMETRACE=<file>) */
+extern bool vkd3d_engine_spin_patched;
+void vkd3d_engine_patch_apply(void);
+void vkd3d_engine_note_fence_poll(struct d3d12_fence *fence, uint64_t value);
+void vkd3d_frametrace_present(void);
+void vkd3d_engine_present(void);
+/* miles-bench live switches (engine_ctl.features, flipped by bench/abf.py) */
+#define VKD3D_BENCH_FEATURE_COPY_KEEP_SYSMEM 0x1u
+#define VKD3D_BENCH_FEATURE_COPY_KEEP_ALL 0x2u
+#define VKD3D_BENCH_FEATURE_QASYNC 0x4u
+#define VKD3D_BENCH_FEATURE_IDXC_OFF 0x8u /* index cache bypassed (VKD3D_BENCH_INDEX_CACHE=1 runs) */
+#define VKD3D_BENCH_FEATURE_GDEC_OFF 0x10u /* vertex decoder takes its original loads (gdec patch) */
+#define VKD3D_BENCH_FEATURE_PARTICLE_NOBARRIER 0x20u /* EXPERIMENT, lossy: particle loop UAV barriers dropped */
+#define VKD3D_BENCH_FEATURE_PARTICLE_BATCH_OFF 0x40u /* particle batching off (VKD3D_BENCH_PARTICLE_BATCH runs) */
+#define VKD3D_BENCH_FEATURE_PARTICLE_DIAG 0x80u /* log the particle loop's descriptor tables (2000 dispatches) */
+#define VKD3D_BENCH_FEATURE_DRAW_DIAG 0x200u /* log the bindings of the next 400 draws after a 3840-byte buffer copy */
+#define VKD3D_BENCH_FEATURE_PDRAW_OFF 0x400u /* particle draws: constants copied the original way */
+#define VKD3D_BENCH_FEATURE_DISCARD_KEEP 0x100u /* DiscardResource on a render target: no UNDEFINED layout barrier */
+#define VKD3D_BENCH_FEATURE_DROPDST_OFF 0x800u /* dropdst patch: no resets of swapped copy destinations */
+uint32_t vkd3d_bench_features(void);
+void vkd3d_bench_pinned_add(const void *ptr, uint64_t size);
+void vkd3d_bench_pinned_remove(const void *ptr);
+void vkd3d_frametrace_count_draw(struct d3d12_command_list *list);
+void vkd3d_frametrace_marker(UINT metadata, const void *data, UINT size);
+void vkd3d_frametrace_event(const char *fmt, ...) VKD3D_PRINTF_FUNC(1, 2);
+void vkd3d_frametrace_bind_heap(struct d3d12_descriptor_heap *heap);
+void vkd3d_frametrace_viewport(float width, float height);
+void vkd3d_gputime_install(struct d3d12_device *device);
+void vkd3d_gputime_present(void);
+void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
+bool vkd3d_gputime_tracking(VkCommandBuffer cmd);
+void vkd3d_gputime_note_stack(VkCommandBuffer cmd, const char *what);
+void vkd3d_gputime_dispatch_label(VkCommandBuffer cmd, uint64_t shader_hash, uint32_t x, uint32_t y, uint32_t z);
+enum vkd3d_frametrace_ref
+{
+    VKD3D_FRAMETRACE_REF_VB,
+    VKD3D_FRAMETRACE_REF_IB,
+    VKD3D_FRAMETRACE_REF_ROOT,
+    VKD3D_FRAMETRACE_REF_VIEW,
+    VKD3D_FRAMETRACE_REF_COPY_SRC,
+    VKD3D_FRAMETRACE_REF_COPY_DST,
+    VKD3D_FRAMETRACE_REF_INDIRECT,
+    VKD3D_FRAMETRACE_REF_DRAW_INDEX,
+    VKD3D_FRAMETRACE_REF_DRAW_VERTEX,
+    VKD3D_FRAMETRACE_REF_INDIRECT_DRAW,
+    VKD3D_FRAMETRACE_REF_COUNT
+};
+extern bool vkd3d_frametrace_watching;
+void vkd3d_frametrace_watch_resource(struct d3d12_resource *resource, bool destroyed);
+void vkd3d_frametrace_ref_va(enum vkd3d_frametrace_ref kind, VkDeviceAddress va, VkDeviceSize size);
+void vkd3d_frametrace_draw_indexed(struct d3d12_command_list *list, UINT index_count, UINT start_index,
+        INT base_vertex);
+void vkd3d_frametrace_ref_view(struct d3d12_device *device, struct d3d12_resource *resource,
+        DXGI_FORMAT format, UINT64 first_element, UINT num_elements, UINT stride, bool raw);
+char *vkd3d_decode_pix_string(UINT metadata, const void *data, size_t size);
 
 #endif  /* __VKD3D_PRIVATE_H */

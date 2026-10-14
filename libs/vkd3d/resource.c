@@ -418,6 +418,19 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
     return true;
 }
 
+/* miles-bench (VKD3D_BENCH_GENERAL_LAYOUTS=1): every image lives in GENERAL on NVIDIA, as vkd3d does
+ * when the driver reports unified image layouts. GENERAL is valid for every use, so the contents are
+ * the same; what changes is that no image layout transitions are recorded. */
+bool vkd3d_bench_general_layouts(const struct d3d12_device *device)
+{
+    static int enabled = -1;
+    char value[16];
+
+    if (enabled < 0)
+        enabled = vkd3d_get_env_var("VKD3D_BENCH_GENERAL_LAYOUTS", value, sizeof(value)) && value[0] == '1';
+    return enabled && device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+}
+
 static bool d3d12_device_prefers_general_depth_stencil(const struct d3d12_device *device)
 {
     if (d3d12_device_supports_unified_layouts(device))
@@ -1114,7 +1127,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
          * Force GENERAL layout if we allow input attachments.
          * This simplifies a lot of things and avoids us being forced to do layout transitions
          * in render passes on top. */
-        if (d3d12_device_supports_unified_layouts(device) ||
+        if (d3d12_device_supports_unified_layouts(device) || vkd3d_bench_general_layouts(device) ||
                 (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) ||
                 (image_info->tiling == VK_IMAGE_TILING_LINEAR) ||
                 (image_info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) ||
@@ -2501,6 +2514,10 @@ static bool d3d12_resource_get_mapped_memory_range(struct d3d12_resource *resour
         return false;
 
     if (device->memory_properties.memoryTypes[resource->mem.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        return false;
+
+    /* geomirror.c: mapped through a shadow, the Vulkan memory itself is not host visible. */
+    if (!(device->memory_properties.memoryTypes[resource->mem.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
         return false;
 
     vk_mapped_range->sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -3914,7 +3931,7 @@ static HRESULT d3d12_resource_init_sparse_info(struct d3d12_resource *resource,
     return S_OK;
 }
 
-static void d3d12_resource_wait_for_sparse_init(struct d3d12_resource *resource)
+void d3d12_resource_wait_for_sparse_init(struct d3d12_resource *resource)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &resource->device->vk_procs;
     VkSemaphoreWaitInfo semaphore_wait;
@@ -3974,6 +3991,9 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
 
+    vkd3d_memtrace_resource_destroy(resource);
+    vkd3d_frametrace_watch_resource(resource, true);
+
     if (resource->flags & VKD3D_RESOURCE_RESERVED)
         d3d12_resource_wait_for_sparse_init(resource);
 
@@ -4000,7 +4020,11 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     if (d3d12_resource_is_texture(resource))
         VK_CALL(vkDestroyImage(device->vk_device, resource->res.vk_image, NULL));
     else if (resource->flags & VKD3D_RESOURCE_RESERVED)
+    {
         VK_CALL(vkDestroyBuffer(device->vk_device, resource->res.vk_buffer, NULL));
+        vkd3d_lightgrid_resource_destroyed(resource);
+        vkd3d_skinbuf_resource_destroyed(resource);
+    }
 
     d3d12_resource_close_export_kmt(resource, device);
 
@@ -4462,6 +4486,10 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
                     device->device_info.properties2.properties.limits.bufferImageGranularity);
         }
 
+        allocate_info.flags |= VKD3D_ALLOCATION_FLAG_BENCH_COMMITTED;
+        if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+            allocate_info.flags |= VKD3D_ALLOCATION_FLAG_BENCH_HOT;
+
         if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, allocation)))
             goto fail;
 
@@ -4545,6 +4573,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
     vkd3d_queue_timeline_trace_register_instantaneous(&device->queue_timeline_trace,
             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMITTED_RESOURCE_ALLOCATION, object->res.cookie.index);
 
+    vkd3d_memtrace_resource_create(device, object, "committed");
+    vkd3d_frametrace_watch_resource(object, false);
     *resource = object;
     return S_OK;
 
@@ -4597,6 +4627,12 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
     if (FAILED(hr = d3d12_resource_validate_heap(desc, heap)))
         return hr;
+
+    /* lightgrid.c: the light grid's heap has no memory; its buffer becomes sparse. */
+    if (heap->lightgrid)
+        return vkd3d_lightgrid_create_placed(device, heap, heap_offset, desc, initial_state, resource);
+    if (heap->skinbuf)
+        return vkd3d_skinbuf_create_placed(device, heap, heap_offset, desc, initial_state, resource);
 
     if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
     {
@@ -4783,6 +4819,8 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         vkd3d_breadcrumb_tracer_register_placed_resource(heap, object, heap_offset, required_size);
 #endif
 
+    vkd3d_memtrace_resource_create(device, object, "placed");
+    vkd3d_frametrace_watch_resource(object, false);
     *resource = object;
     return S_OK;
 
@@ -4883,6 +4921,7 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
     if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
         d3d12_resource_tag_debug_name(object, device, "Reserved Resource");
 
+    vkd3d_memtrace_resource_create(device, object, "reserved");
     *resource = object;
     return S_OK;
 
@@ -9140,6 +9179,8 @@ static D3D12_DESCRIPTOR_HEAP_DESC * STDMETHODCALLTYPE d3d12_descriptor_heap_GetD
     TRACE("iface %p, desc %p.\n", iface, desc);
 
     *desc = heap->desc;
+    if (heap->pdraw_tail_base)
+        desc->NumDescriptors = heap->pdraw_tail_base;
     return desc;
 }
 
@@ -9337,6 +9378,54 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_heap(struct d3d12_descrip
     return S_OK;
 }
 
+/* miles-bench: VKD3D_BENCH_DESC_SYSMEM_IDX=3,4,7,8 lists (1-based, in creation order) the large
+ * shader-visible CBV_SRV_UAV heaps whose descriptor buffer goes to system memory; the others keep
+ * the default DEVICE_LOCAL|HOST_VISIBLE preference (the 246 MiB BAR window on this GPU). The
+ * engine creates its eight 1M-descriptor heaps in a fixed order and only binds #1, #2 (many times
+ * a frame) and #5, #6 (about once a frame); by default #1-#3 got the BAR, so #5/#6 were fetched
+ * over PCIe while #3 sat unused in VRAM. With the list set, the heaps' auxiliary buffers go to
+ * system memory too, so four heaps fit the window. */
+static bool vkd3d_bench_desc_policy(char *list, size_t size)
+{
+    return vkd3d_get_env_var("VKD3D_BENCH_DESC_SYSMEM_IDX", list, size) && *list;
+}
+
+static VkMemoryPropertyFlags vkd3d_bench_desc_heap_properties(const struct d3d12_descriptor_heap *heap,
+        VkMemoryPropertyFlags default_flags)
+{
+    static unsigned int big_heaps;
+    char list[64], *p;
+    unsigned int index;
+
+    if (heap->bench_null_heap)
+        return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!vkd3d_bench_desc_policy(list, sizeof(list)) || heap->desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            heap->desc.NumDescriptors < 65536)
+        return default_flags;
+    index = __atomic_add_fetch(&big_heaps, 1, __ATOMIC_RELAXED);
+    for (p = list; *p; p++)
+    {
+        if ((p == list || p[-1] == ',') && (unsigned int)atoi(p) == index)
+        {
+            INFO("bench: descriptor heap #%u (%u descriptors) in system memory.\n", index, heap->desc.NumDescriptors);
+            return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        }
+    }
+    INFO("bench: descriptor heap #%u (%u descriptors) prefers the BAR window.\n", index, heap->desc.NumDescriptors);
+    return default_flags;
+}
+
+static VkMemoryPropertyFlags vkd3d_bench_desc_aux_properties(const struct d3d12_descriptor_heap *heap,
+        VkMemoryPropertyFlags default_flags)
+{
+    char list[64];
+
+    if (heap->bench_null_heap)
+        return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return vkd3d_bench_desc_policy(list, sizeof(list)) ?
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : default_flags;
+}
+
 static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descriptor_heap *descriptor_heap)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &descriptor_heap->device->vk_procs;
@@ -9470,7 +9559,8 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descr
                 "descriptor-buffer", &descriptor_heap->descriptor_buffer.vk_buffer)))
             return hr;
 
-        property_flags = device->memory_info.descriptor_heap_memory_properties;
+        property_flags = vkd3d_bench_desc_heap_properties(descriptor_heap,
+                device->memory_info.descriptor_heap_memory_properties);
 
         if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, descriptor_heap->descriptor_buffer.vk_buffer,
                 property_flags, 0,
@@ -9480,6 +9570,12 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descr
             descriptor_heap->descriptor_buffer.vk_buffer = VK_NULL_HANDLE;
             return hr;
         }
+
+        if (descriptor_heap->desc.NumDescriptors >= 65536)
+            INFO("bench: descriptor heap %p (%u descriptors, %"PRIu64" bytes) got memory type %u.\n",
+                    (void *)descriptor_heap, descriptor_heap->desc.NumDescriptors,
+                    (uint64_t)descriptor_heap->descriptor_buffer.device_allocation.size,
+                    descriptor_heap->descriptor_buffer.device_allocation.vk_memory_type);
 
         descriptor_heap->descriptor_buffer.va =
                 vkd3d_get_buffer_device_address(device, descriptor_heap->descriptor_buffer.vk_buffer);
@@ -9820,7 +9916,7 @@ static HRESULT d3d12_descriptor_heap_init_data_buffer(struct d3d12_descriptor_he
                 "descriptor-buffer", &descriptor_heap->vk_buffer)))
             return hr;
 
-        property_flags = device->memory_info.descriptor_heap_memory_properties;
+        property_flags = vkd3d_bench_desc_aux_properties(descriptor_heap, device->memory_info.descriptor_heap_memory_properties);
 
         if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, descriptor_heap->vk_buffer,
                 property_flags, 0, &descriptor_heap->device_allocation)))
@@ -10143,8 +10239,39 @@ static HRESULT d3d12_descriptor_heap_init_legacy(struct d3d12_descriptor_heap *d
     return S_OK;
 }
 
+/* miles-bench lazy heaps: what a heap shares with the null heap while borrowed. */
+static void d3d12_descriptor_heap_copy_memory_fields(struct d3d12_descriptor_heap *dst,
+        const struct d3d12_descriptor_heap *src)
+{
+    memcpy(dst->fast_pointer_bank, src->fast_pointer_bank, sizeof(dst->fast_pointer_bank));
+    dst->descriptor_buffer = src->descriptor_buffer;
+    dst->vk_descriptor_pool = src->vk_descriptor_pool;
+    memcpy(dst->sets, src->sets, sizeof(dst->sets));
+    dst->device_allocation = src->device_allocation;
+    dst->vk_buffer = src->vk_buffer;
+    dst->host_memory = src->host_memory;
+    dst->raw_va_aux_buffer = src->raw_va_aux_buffer;
+    dst->buffer_ranges = src->buffer_ranges;
+    dst->null_descriptor_template = src->null_descriptor_template;
+}
+
+static void d3d12_descriptor_heap_clear_memory_fields(struct d3d12_descriptor_heap *heap)
+{
+    memset(heap->fast_pointer_bank, 0, sizeof(heap->fast_pointer_bank));
+    memset(&heap->descriptor_buffer, 0, sizeof(heap->descriptor_buffer));
+    heap->vk_descriptor_pool = VK_NULL_HANDLE;
+    memset(heap->sets, 0, sizeof(heap->sets));
+    memset(&heap->device_allocation, 0, sizeof(heap->device_allocation));
+    heap->vk_buffer = VK_NULL_HANDLE;
+    heap->host_memory = NULL;
+    memset(&heap->raw_va_aux_buffer, 0, sizeof(heap->raw_va_aux_buffer));
+    memset(&heap->buffer_ranges, 0, sizeof(heap->buffer_ranges));
+    memset(&heap->null_descriptor_template, 0, sizeof(heap->null_descriptor_template));
+}
+
 static HRESULT d3d12_descriptor_heap_init(struct d3d12_descriptor_heap *descriptor_heap,
-        struct d3d12_device *device, const D3D12_DESCRIPTOR_HEAP_DESC *desc)
+        struct d3d12_device *device, const D3D12_DESCRIPTOR_HEAP_DESC *desc,
+        const struct d3d12_descriptor_heap *borrow_from, bool null_heap)
 {
     HRESULT hr;
 
@@ -10154,11 +10281,18 @@ static HRESULT d3d12_descriptor_heap_init(struct d3d12_descriptor_heap *descript
     descriptor_heap->internal_refcount = 1;
     descriptor_heap->device = device;
     descriptor_heap->desc = *desc;
+    descriptor_heap->bench_null_heap = null_heap;
 
     if (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
         descriptor_heap->gpu_va = d3d12_device_get_descriptor_heap_gpu_va(device, desc->Type);
 
-    if (d3d12_device_use_descriptor_heap(device))
+    if (borrow_from)
+    {
+        d3d12_descriptor_heap_copy_memory_fields(descriptor_heap, borrow_from);
+        descriptor_heap->bench_borrowed = 1;
+        descriptor_heap->bench_lazy = 1;
+    }
+    else if (d3d12_device_use_descriptor_heap(device))
     {
         if (FAILED(hr = d3d12_descriptor_heap_create_descriptor_heap(descriptor_heap)))
             goto fail;
@@ -10176,7 +10310,7 @@ static HRESULT d3d12_descriptor_heap_init(struct d3d12_descriptor_heap *descript
     }
 
     /* Legacy junk that deals with mapping sets to the descriptor buffer. */
-    if (!d3d12_device_use_descriptor_heap(device))
+    if (!d3d12_device_use_descriptor_heap(device) && !borrow_from)
         if (FAILED(hr = d3d12_descriptor_heap_init_legacy(descriptor_heap, device, desc)))
             goto fail;
 
@@ -10245,13 +10379,171 @@ static void d3d12_descriptor_heap_report_allocation(const D3D12_DESCRIPTOR_HEAP_
 }
 #endif
 
+/* miles-bench (VKD3D_BENCH_HEAPSCAN=1): the large shader-visible resource heaps in creation order,
+ * and how many of their descriptors hold a view (logged from the frame trace every 30 s). */
+static struct d3d12_descriptor_heap *vkd3d_bench_big_heaps[16];
+static pthread_mutex_t vkd3d_bench_big_heaps_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void vkd3d_bench_heap_scan(void)
+{
+    const struct vkd3d_descriptor_metadata_types *types;
+    const struct vkd3d_descriptor_metadata_view *views;
+    struct d3d12_descriptor_heap *heap;
+    unsigned int i, j, used, typed, highest;
+    struct d3d12_desc_split d;
+
+    pthread_mutex_lock(&vkd3d_bench_big_heaps_lock);
+    for (i = 0; i < ARRAY_SIZE(vkd3d_bench_big_heaps); i++)
+    {
+        if (!(heap = vkd3d_bench_big_heaps[i]))
+            continue;
+        d = d3d12_desc_decode_va_raw(heap->cpu_va.ptr);
+        views = d.view;
+        types = d.types;
+        used = typed = highest = 0;
+        for (j = 0; j < heap->desc.NumDescriptors; j++)
+        {
+            if (types[j].set_info_mask != heap->null_descriptor_template.set_info_mask)
+                typed++;
+            if (views[j].info.flags)
+            {
+                used++;
+                highest = j + 1;
+            }
+        }
+        INFO("bench: heapscan #%u %p: %u of %u descriptors hold a view (%u non-null types), highest %u.\n",
+                i + 1, (void *)heap, used, heap->desc.NumDescriptors, typed, highest);
+    }
+    pthread_mutex_unlock(&vkd3d_bench_big_heaps_lock);
+}
+
+/* miles-bench lazy heaps (VKD3D_BENCH_LAZY_HEAPS=1).
+ *
+ * The engine creates eight shader-visible resource heaps of 1,000,000 descriptors (64 MB of
+ * descriptor buffer + 8 MB of raw-VA/offset buffer each, all in GPU-visible memory the driver pins)
+ * and only ever writes descriptors into two of them; the other six are bound now and then (two of
+ * them ~40 times a second) but hold nothing but null descriptors. Their memory is byte-for-byte
+ * the same as a fresh heap's. So a large heap starts out sharing one never-written "null heap"
+ * (system memory) for everything the GPU and the CPU see of its descriptor memory, and gets memory
+ * of its own at its first descriptor write (or copy, from or to it): every CPU access decodes the
+ * handle with d3d12_desc_decode_va, which materializes a borrowed heap first. Binding reads the
+ * buffer under the lazy lock and does not materialize. */
+static pthread_mutex_t vkd3d_lazy_heap_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct d3d12_descriptor_heap *vkd3d_lazy_null_heap;
+static HRESULT d3d12_descriptor_heap_create_internal(struct d3d12_device *device,
+        const D3D12_DESCRIPTOR_HEAP_DESC *desc, bool allow_lazy, bool null_heap,
+        struct d3d12_descriptor_heap **descriptor_heap);
+
+static bool vkd3d_bench_lazy_heaps(void)
+{
+    static int lazy = -1;
+    char env[8];
+
+    if (lazy < 0)
+        lazy = vkd3d_get_env_var("VKD3D_BENCH_LAZY_HEAPS", env, sizeof(env)) && atoi(env) == 1;
+    return lazy;
+}
+
+/* The null heap for heaps like desc (padded size), created on first use. Called with the lock held. */
+static struct d3d12_descriptor_heap *vkd3d_lazy_null_heap_get(struct d3d12_device *device,
+        const D3D12_DESCRIPTOR_HEAP_DESC *app_desc, uint32_t padded_count)
+{
+    struct d3d12_descriptor_heap *heap;
+
+    if (!vkd3d_lazy_null_heap)
+    {
+        if (FAILED(d3d12_descriptor_heap_create_internal(device, app_desc, false, true, &heap)))
+            return NULL;
+        vkd3d_lazy_null_heap = heap;
+        INFO("bench: lazy heaps: null heap %p (%u descriptors, %"PRIu64" + %"PRIu64" bytes, memory types %u/%u).\n",
+                (void *)heap, heap->desc.NumDescriptors, (uint64_t)heap->descriptor_buffer.device_allocation.size,
+                (uint64_t)heap->device_allocation.size, heap->descriptor_buffer.device_allocation.vk_memory_type,
+                heap->device_allocation.vk_memory_type);
+    }
+    if (vkd3d_lazy_null_heap->desc.NumDescriptors != padded_count ||
+            vkd3d_lazy_null_heap->desc.Flags != app_desc->Flags || vkd3d_lazy_null_heap->device != device)
+        return NULL;
+    return vkd3d_lazy_null_heap;
+}
+
+/* Returns true if the heap still shares the null heap. */
+bool d3d12_descriptor_heap_bind_buffer(struct d3d12_descriptor_heap *heap, VkDeviceAddress *va, VkBuffer *vk_buffer)
+{
+    bool borrowed;
+
+    pthread_mutex_lock(&vkd3d_lazy_heap_lock);
+    *va = heap->descriptor_buffer.va;
+    *vk_buffer = heap->descriptor_buffer.vk_buffer;
+    if ((borrowed = heap->bench_borrowed))
+        heap->bench_borrowed_binds++;
+    pthread_mutex_unlock(&vkd3d_lazy_heap_lock);
+    return borrowed;
+}
+
+void d3d12_descriptor_heap_materialize(struct d3d12_descriptor_heap *heap)
+{
+    struct d3d12_descriptor_heap *tmp;
+    unsigned int i;
+    HRESULT hr;
+
+    pthread_mutex_lock(&vkd3d_lazy_heap_lock);
+    if (!heap->bench_borrowed)
+    {
+        pthread_mutex_unlock(&vkd3d_lazy_heap_lock);
+        return;
+    }
+    /* Built aside, then published: other threads may be reading the borrowed fields. */
+    if (!(tmp = vkd3d_malloc(sizeof(*tmp))))
+    {
+        ERR("bench: lazy heaps: out of memory.\n");
+        abort();
+    }
+    *tmp = *heap;
+    d3d12_descriptor_heap_clear_memory_fields(tmp);
+    tmp->bench_borrowed = 0;
+    if (FAILED(hr = d3d12_descriptor_heap_create_descriptor_buffer(tmp)) ||
+            FAILED(hr = d3d12_descriptor_heap_init_legacy(tmp, tmp->device, &tmp->desc)))
+    {
+        ERR("bench: lazy heaps: could not give heap %p memory of its own, hr %#x.\n", (void *)heap, (unsigned int)hr);
+        abort();
+    }
+    for (i = 0; i < ARRAY_SIZE(tmp->descriptor_buffer.offsets); i++)
+    {
+        if (tmp->descriptor_buffer.offsets[i] != heap->descriptor_buffer.offsets[i])
+        {
+            ERR("bench: lazy heaps: heap %p layout differs from the null heap's.\n", (void *)heap);
+            abort();
+        }
+    }
+    d3d12_descriptor_heap_copy_memory_fields(heap, tmp);
+    __atomic_store_n(&heap->bench_borrowed, 0, __ATOMIC_RELEASE);
+    INFO("bench: lazy heaps: heap %p got memory of its own at its first descriptor write "
+            "(%"PRIu64" + %"PRIu64" bytes, memory types %u/%u; bound %u times before).\n",
+            (void *)heap, (uint64_t)heap->descriptor_buffer.device_allocation.size,
+            (uint64_t)heap->device_allocation.size, heap->descriptor_buffer.device_allocation.vk_memory_type,
+            heap->device_allocation.vk_memory_type, heap->bench_borrowed_binds);
+    pthread_mutex_unlock(&vkd3d_lazy_heap_lock);
+    vkd3d_free(tmp);
+}
+
 HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
         const D3D12_DESCRIPTOR_HEAP_DESC *desc, struct d3d12_descriptor_heap **descriptor_heap)
 {
+    return d3d12_descriptor_heap_create_internal(device, desc, true, false, descriptor_heap);
+}
+
+static HRESULT d3d12_descriptor_heap_create_internal(struct d3d12_device *device,
+        const D3D12_DESCRIPTOR_HEAP_DESC *desc, bool allow_lazy, bool null_heap,
+        struct d3d12_descriptor_heap **descriptor_heap)
+{
+    struct d3d12_descriptor_heap *borrow_from = NULL;
+    const D3D12_DESCRIPTOR_HEAP_DESC *app_desc = desc;
     size_t max_descriptor_count, descriptor_size;
+    D3D12_DESCRIPTOR_HEAP_DESC padded_desc;
     struct d3d12_descriptor_heap *object;
     unsigned int num_descriptor_bits = 0;
     unsigned int num_descriptors_pot = 0;
+    uint32_t pdraw_tail_base = 0;
     size_t required_size;
     size_t alignment;
     HRESULT hr;
@@ -10287,6 +10579,21 @@ HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
         {
             WARN("Unsupported descriptor count %u for heap type %u (max %zu).\n", desc->NumDescriptors, desc->Type, max_descriptor_count);
             return E_INVALIDARG;
+        }
+
+        /* miles-bench particle draws (command.c): private descriptors after the app's last one in
+         * the large resource heap. The bindless set layouts are sized for them too (state.c);
+         * GetDesc reports the app's count. */
+        if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && desc->NumDescriptors >= 65536 &&
+                vkd3d_pdraw_tail_count() && !d3d12_device_use_embedded_mutable_descriptors(device) &&
+                !d3d12_device_use_descriptor_heap(device))
+        {
+            padded_desc = *desc;
+            padded_desc.NumDescriptors += vkd3d_pdraw_tail_count();
+            pdraw_tail_base = desc->NumDescriptors;
+            desc = &padded_desc;
+            INFO("particle draws: resource heap of %u descriptors gets %u private ones.\n",
+                    pdraw_tail_base, vkd3d_pdraw_tail_count());
         }
     }
     else
@@ -10352,11 +10659,23 @@ HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
         return E_OUTOFMEMORY;
     memset(object, 0, required_size);
 
-    if (FAILED(hr = d3d12_descriptor_heap_init(object, device, desc)))
+    if (allow_lazy && vkd3d_bench_lazy_heaps() && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+            (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && app_desc->NumDescriptors >= 65536 &&
+            d3d12_device_uses_descriptor_buffers(device) && !d3d12_device_use_descriptor_heap(device) &&
+            !d3d12_device_use_embedded_mutable_descriptors(device))
+    {
+        pthread_mutex_lock(&vkd3d_lazy_heap_lock);
+        borrow_from = vkd3d_lazy_null_heap_get(device, app_desc, desc->NumDescriptors);
+        pthread_mutex_unlock(&vkd3d_lazy_heap_lock);
+    }
+
+    if (FAILED(hr = d3d12_descriptor_heap_init(object, device, desc, borrow_from, null_heap)))
     {
         vkd3d_free_aligned(object);
         return hr;
     }
+    if (borrow_from)
+        INFO("bench: lazy heaps: heap %p (%u descriptors) shares the null heap.\n", (void *)object, desc->NumDescriptors);
 
     if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
     {
@@ -10421,6 +10740,20 @@ HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
     }
 
     d3d12_descriptor_heap_init_descriptors(object);
+    object->pdraw_tail_base = pdraw_tail_base;
+
+    if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && desc->NumDescriptors >= 65536 &&
+            (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !d3d12_device_use_embedded_mutable_descriptors(device))
+    {
+        unsigned int i;
+
+        pthread_mutex_lock(&vkd3d_bench_big_heaps_lock);
+        for (i = 0; i < ARRAY_SIZE(vkd3d_bench_big_heaps) && vkd3d_bench_big_heaps[i]; i++)
+            ;
+        if (i < ARRAY_SIZE(vkd3d_bench_big_heaps))
+            vkd3d_bench_big_heaps[i] = object;
+        pthread_mutex_unlock(&vkd3d_bench_big_heaps_lock);
+    }
 
     TRACE("Created descriptor heap %p.\n", object);
 
@@ -10438,6 +10771,18 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
 {
     const struct vkd3d_vk_device_procs *vk_procs = &descriptor_heap->device->vk_procs;
     struct d3d12_device *device = descriptor_heap->device;
+    unsigned int i;
+
+    pthread_mutex_lock(&vkd3d_bench_big_heaps_lock);
+    for (i = 0; i < ARRAY_SIZE(vkd3d_bench_big_heaps); i++)
+    {
+        if (vkd3d_bench_big_heaps[i] == descriptor_heap)
+            vkd3d_bench_big_heaps[i] = NULL;
+    }
+    pthread_mutex_unlock(&vkd3d_bench_big_heaps_lock);
+
+    if (descriptor_heap->bench_borrowed)
+        d3d12_descriptor_heap_clear_memory_fields(descriptor_heap);
 
 #ifndef VKD3D_NO_TRACE_MESSAGES
     if (descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
@@ -10946,6 +11291,12 @@ static VkMemoryPropertyFlags vkd3d_memory_info_descriptor_heap_memory_properties
         VKD3D_UNUSED const struct vkd3d_memory_topology *topology,
         VKD3D_UNUSED const struct d3d12_device *device)
 {
+    char env[8];
+
+    /* miles-bench experiment: all descriptor heaps in system memory, none in the BAR window. */
+    if (vkd3d_get_env_var("VKD3D_BENCH_DESC_SYSMEM", env, sizeof(env)) && env[0] == '1')
+        return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
     if (VKD3D_CONFIG_FLAG_IS_SET(FORCE_HOST_CACHED))
     {
         return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |

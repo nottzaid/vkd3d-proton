@@ -4220,6 +4220,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     }
 
     device->vk_device = vk_device;
+    vkd3d_gputime_install(device);
 
     if (FAILED(hr = d3d12_device_create_vkd3d_queues(device, &device_queue_info)))
     {
@@ -6505,6 +6506,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateDescriptorHeap(d3d12_device_
     if (FAILED(hr = d3d12_descriptor_heap_create(device, desc, &object)))
         return hr;
 
+    vkd3d_memtrace_descriptor_heap_create(device, object);
+
     return return_interface(&object->ID3D12DescriptorHeap_iface,
             &IID_ID3D12DescriptorHeap, riid, descriptor_heap);
 }
@@ -6570,6 +6573,8 @@ static void STDMETHODCALLTYPE d3d12_device_CreateConstantBufferView_heap(d3d12_d
 
     TRACE("iface %p, desc %p, descriptor %#zx.\n", iface, desc, descriptor.ptr);
 
+    if (desc)
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_VIEW, desc->BufferLocation, desc->SizeInBytes);
     d3d12_desc_create_cbv_heap(descriptor.ptr, device, desc);
 }
 
@@ -6580,6 +6585,8 @@ static void STDMETHODCALLTYPE d3d12_device_CreateConstantBufferView_embedded(d3d
 
     TRACE("iface %p, desc %p, descriptor %#zx.\n", iface, desc, descriptor.ptr);
 
+    if (desc)
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_VIEW, desc->BufferLocation, desc->SizeInBytes);
     d3d12_desc_create_cbv_embedded(descriptor.ptr, device, desc);
 }
 
@@ -6590,6 +6597,8 @@ static void STDMETHODCALLTYPE d3d12_device_CreateConstantBufferView_default(d3d1
 
     TRACE("iface %p, desc %p, descriptor %#zx.\n", iface, desc, descriptor.ptr);
 
+    if (desc)
+        vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_VIEW, desc->BufferLocation, desc->SizeInBytes);
     d3d12_desc_create_cbv(descriptor.ptr, device, desc);
 }
 
@@ -6602,6 +6611,9 @@ static void STDMETHODCALLTYPE d3d12_device_CreateShaderResourceView_heap(d3d12_d
     TRACE("iface %p, resource %p, desc %p, descriptor %#zx.\n",
             iface, resource, desc, descriptor.ptr);
 
+    if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+        vkd3d_frametrace_ref_view(device, impl_from_ID3D12Resource(resource), desc->Format, desc->Buffer.FirstElement,
+                desc->Buffer.NumElements, desc->Buffer.StructureByteStride, desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
     d3d12_desc_create_srv_heap(descriptor.ptr, device, impl_from_ID3D12Resource(resource), desc);
 }
 
@@ -6614,6 +6626,9 @@ static void STDMETHODCALLTYPE d3d12_device_CreateShaderResourceView_embedded(d3d
     TRACE("iface %p, resource %p, desc %p, descriptor %#zx.\n",
             iface, resource, desc, descriptor.ptr);
 
+    if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+        vkd3d_frametrace_ref_view(device, impl_from_ID3D12Resource(resource), desc->Format, desc->Buffer.FirstElement,
+                desc->Buffer.NumElements, desc->Buffer.StructureByteStride, desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
     d3d12_desc_create_srv_embedded(descriptor.ptr, device, impl_from_ID3D12Resource(resource), desc);
 }
 
@@ -6626,6 +6641,9 @@ static void STDMETHODCALLTYPE d3d12_device_CreateShaderResourceView_default(d3d1
     TRACE("iface %p, resource %p, desc %p, descriptor %#zx.\n",
             iface, resource, desc, descriptor.ptr);
 
+    if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+        vkd3d_frametrace_ref_view(device, impl_from_ID3D12Resource(resource), desc->Format, desc->Buffer.FirstElement,
+                desc->Buffer.NumElements, desc->Buffer.StructureByteStride, desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW);
     d3d12_desc_create_srv(descriptor.ptr, device, impl_from_ID3D12Resource(resource), desc);
 }
 
@@ -6640,6 +6658,9 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_heap(d3d12_
     TRACE("iface %p, resource %p, counter_resource %p, desc %p, descriptor %#zx.\n",
             iface, resource, counter_resource, desc, descriptor.ptr);
 
+    if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        vkd3d_frametrace_ref_view(device, d3d12_resource_, desc->Format, desc->Buffer.FirstElement,
+                desc->Buffer.NumElements, desc->Buffer.StructureByteStride, desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
     d3d12_desc_create_uav_heap(descriptor.ptr,
             device, d3d12_resource_,
             impl_from_ID3D12Resource(counter_resource), desc);
@@ -6683,6 +6704,9 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_embedded(d3
     TRACE("iface %p, resource %p, counter_resource %p, desc %p, descriptor %#zx.\n",
             iface, resource, counter_resource, desc, descriptor.ptr);
 
+    if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        vkd3d_frametrace_ref_view(device, d3d12_resource_, desc->Format, desc->Buffer.FirstElement,
+                desc->Buffer.NumElements, desc->Buffer.StructureByteStride, desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
     d3d12_desc_create_uav_embedded(descriptor.ptr,
             device, d3d12_resource_,
             impl_from_ID3D12Resource(counter_resource), desc);
@@ -6701,6 +6725,9 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_default(d3d
     TRACE("iface %p, resource %p, counter_resource %p, desc %p, descriptor %#zx.\n",
             iface, resource, counter_resource, desc, descriptor.ptr);
 
+    if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        vkd3d_frametrace_ref_view(device, d3d12_resource_, desc->Format, desc->Buffer.FirstElement,
+                desc->Buffer.NumElements, desc->Buffer.StructureByteStride, desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
     d3d12_desc_create_uav(descriptor.ptr,
             device, d3d12_resource_,
             impl_from_ID3D12Resource(counter_resource), desc);
@@ -10305,6 +10332,16 @@ static void d3d12_device_caps_init_feature_options4(struct d3d12_device *device)
 
     /* FP16 and FP64 must preserve denorms. Only FP32 can change, so we can accept both 32_BIT_INDEPENDENCY_ONLY and ALL. */
     options4->Native16BitShaderOpsSupported = d3d12_device_supports_16bit_shader_ops(device);
+
+    /* miles-bench: Pascal runs FP16 math at 1/64 rate, so record what the game is told. */
+    INFO("miles-bench: Native16BitShaderOpsSupported %u (shaderFloat16 %u, shaderInt16 %u, storageBuffer16BitAccess %u, "
+            "shaderDenormPreserveFloat16 %u, denormBehaviorIndependence %u).\n",
+            options4->Native16BitShaderOpsSupported,
+            device->device_info.vulkan_1_2_features.shaderFloat16,
+            device->device_info.features2.features.shaderInt16,
+            device->device_info.vulkan_1_1_features.storageBuffer16BitAccess,
+            device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat16,
+            device->device_info.vulkan_1_2_properties.denormBehaviorIndependence);
 }
 
 static void d3d12_device_caps_init_feature_options5(struct d3d12_device *device)
@@ -11889,6 +11926,8 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
         d3d12_add_device_singleton(object, create_info->adapter_luid);
 
     pthread_mutex_unlock(&d3d12_device_map_mutex);
+
+    vkd3d_engine_patch_apply();
 
     *device = object;
 

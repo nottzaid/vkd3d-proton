@@ -1679,6 +1679,7 @@ HRESULT STDMETHODCALLTYPE d3d12_object_SetName(ID3D12Object *iface, const WCHAR 
     size_t size = 0;
 
     TRACE("iface %p, name %s.\n", iface, debugstr_w(name));
+    vkd3d_memtrace_set_name(iface, name);
 
     if (name)
         size = sizeof(WCHAR) * (vkd3d_wcslen(name) + 1);

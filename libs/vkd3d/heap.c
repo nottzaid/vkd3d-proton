@@ -76,6 +76,7 @@ static ULONG STDMETHODCALLTYPE d3d12_heap_AddRef(d3d12_heap_iface *iface)
 static void d3d12_heap_destroy(struct d3d12_heap *heap)
 {
     TRACE("Destroying heap %p.\n", heap);
+    vkd3d_memtrace_heap_destroy(heap);
 
     d3d_destruction_notifier_free(&heap->destruction_notifier);
 
@@ -86,6 +87,8 @@ static void d3d12_heap_destroy(struct d3d12_heap *heap)
     pthread_mutex_destroy(&heap->placement_lock);
 #endif
 
+    vkd3d_geomirror_unregister(heap);
+    vkd3d_index_cache_unregister(heap);
     vkd3d_free_memory(heap->device, &heap->device->memory_allocator, &heap->allocation);
     vkd3d_private_store_destroy(&heap->private_store);
     vkd3d_free(heap);
@@ -303,6 +306,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         const D3D12_HEAP_DESC *desc, void* host_address)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
+    bool geomirror;
     HRESULT hr;
 
     memset(heap, 0, sizeof(*heap));
@@ -329,6 +333,34 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     memset(&alloc_info, 0, sizeof(alloc_info));
     alloc_info.heap_desc = heap->desc;
     alloc_info.host_ptr = host_address;
+
+    /* lightgrid.c: the light grid's 512 MiB heap keeps one 64 KiB page of its own (so the heap is
+     * an ordinary one to everything else); its buffer is sparse and backed page by page. */
+    if (!host_address && vkd3d_lightgrid_heap_wanted(&heap->desc))
+    {
+        heap->lightgrid = true;
+        alloc_info.heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    }
+    /* skinbuf.c: same for the skinning buffer's 196 MiB heap, backed as the engine allocates. */
+    else if (!host_address && vkd3d_skinbuf_heap_wanted(&heap->desc))
+    {
+        heap->skinbuf = true;
+        alloc_info.heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    }
+
+    /* geomirror.c: the engine's system-memory geometry heap goes to VRAM, the CPU gets a shadow. */
+    if ((geomirror = !host_address && vkd3d_geomirror_wanted(&heap->desc)))
+    {
+        alloc_info.heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        alloc_info.heap_desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        alloc_info.heap_desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    }
+    else if (!host_address && vkd3d_geometry_cached_wanted(&heap->desc))
+    {
+        /* Allocation only: the heap keeps the properties the game asked for. */
+        alloc_info.heap_desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        INFO("Geometry heap of %"PRIu64" bytes: CPU-cached system memory.\n", (uint64_t)heap->desc.SizeInBytes);
+    }
 
     if ((alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
         d3d12_device_allow_image_heap_suballocation(device))
@@ -382,6 +414,22 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         return hr;
     }
 
+    if (geomirror && FAILED(vkd3d_geomirror_register(device, heap)))
+    {
+        /* No shadow: fall back to the heap the game asked for. */
+        vkd3d_free_memory(device, &device->memory_allocator, &heap->allocation);
+        alloc_info.heap_desc = heap->desc;
+        if (FAILED(hr = vkd3d_allocate_heap_memory(device,
+                &device->memory_allocator, &alloc_info, &heap->allocation)))
+        {
+            vkd3d_private_store_destroy(&heap->private_store);
+            return hr;
+        }
+    }
+
+    if (!geomirror && !host_address && vkd3d_index_cache_wanted(&heap->desc))
+        vkd3d_index_cache_register(device, heap);
+
     heap->priority.allows_dynamic_residency = 
         device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
         heap->allocation.chunk == NULL /* not suballocated */ &&
@@ -416,6 +464,7 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
     }
 
     TRACE("Created heap %p.\n", object);
+    vkd3d_memtrace_heap_create(device, object);
 
     *heap = object;
     return S_OK;

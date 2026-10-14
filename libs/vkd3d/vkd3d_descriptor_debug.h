@@ -24,7 +24,11 @@
 
 /* Cost is 1 bit per cookie, and spending 256 MB of host memory on this is reasonable,
  * and overflowing this pool should never happen. */
-#define VKD3D_DESCRIPTOR_DEBUG_DEFAULT_NUM_COOKIES (2 * 1000 * 1000 * 1000)
+/* miles-bench: 1 << 24 cookies, followed in the payload by one access counter per cookie slot
+ * (cookie & (VKD3D_DESCRIPTOR_QA_COUNT_SLOTS - 1)); dxil-spirv's descriptor_qa.hpp hardcodes the same
+ * layout (DESCRIPTOR_QA_COUNT_BASE = 1 << 24 / 32). */
+#define VKD3D_DESCRIPTOR_DEBUG_DEFAULT_NUM_COOKIES (1u << 24)
+#define VKD3D_DESCRIPTOR_QA_COUNT_SLOTS (1u << 20)
 #define VKD3D_DESCRIPTOR_DEBUG_NUM_PAD_DESCRIPTORS 1
 
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA

@@ -350,11 +350,84 @@ static void *vkd3d_descriptor_debug_qa_check_instruction(void *userdata)
 static void vkd3d_descriptor_debug_qa_check_report_fault(
         struct vkd3d_descriptor_qa_global_info *global_info);
 
+/* miles-bench: VKD3D_BENCH_QACOUNT=<file>. Every ~2 s, append the access counts gathered since the last
+ * snapshot: "QT\t<ms>\t<presents so far>" then "QC\t<slot>\t<count>" per slot that moved. Slots are cookie & (slots - 1);
+ * memtrace RK lines and the CV lines here map cookies to resources and views. */
+static FILE *qacount_file;
+static uint32_t *qacount_prev;
+static uint64_t qacount_last_ns;
+static pthread_mutex_t qacount_lock = PTHREAD_MUTEX_INITIALIZER;
+
+uint64_t vkd3d_bench_present_count(void);
+
+static uint64_t qacount_now_ns(void)
+{
+    return vkd3d_get_current_time_ns();
+}
+
+static void qacount_open(void)
+{
+    static bool tried;
+    char path[VKD3D_PATH_MAX];
+
+    if (tried)
+        return;
+    tried = true;
+    if (!vkd3d_get_env_var("VKD3D_BENCH_QACOUNT", path, sizeof(path)) || !path[0])
+        return;
+    if (!(qacount_file = fopen(path, "w")))
+        return;
+    qacount_prev = vkd3d_calloc(VKD3D_DESCRIPTOR_QA_COUNT_SLOTS, sizeof(*qacount_prev));
+    fprintf(qacount_file, "# qacount v1 slots %u\n", VKD3D_DESCRIPTOR_QA_COUNT_SLOTS);
+}
+
+static void qacount_snapshot(struct vkd3d_descriptor_qa_global_info *global_info)
+{
+    static uint32_t *snap;
+    uint64_t now = qacount_now_ns();
+    const uint32_t *counts;
+    uint32_t i, moved = 0;
+
+    if (!qacount_file || !qacount_prev || now - qacount_last_ns < 2000000000ull)
+        return;
+    if (!snap && !(snap = vkd3d_malloc(VKD3D_DESCRIPTOR_QA_COUNT_SLOTS * sizeof(*snap))))
+        return;
+    qacount_last_ns = now;
+    counts = global_info->payload_data->live_status_table + (global_info->num_cookies + 31) / 32;
+    memcpy(snap, counts, VKD3D_DESCRIPTOR_QA_COUNT_SLOTS * sizeof(*snap));
+    pthread_mutex_lock(&qacount_lock);
+    fprintf(qacount_file, "QT\t%.3f\t%"PRIu64"\n", now / 1e6, vkd3d_bench_present_count());
+    for (i = 0; i < VKD3D_DESCRIPTOR_QA_COUNT_SLOTS; i++)
+    {
+        if (snap[i] != qacount_prev[i])
+        {
+            fprintf(qacount_file, "QC\t%u\t%u\n", i, snap[i] - qacount_prev[i]);
+            qacount_prev[i] = snap[i];
+            moved++;
+        }
+    }
+    fprintf(qacount_file, "QE\t%u\n", moved);
+    pthread_mutex_unlock(&qacount_lock);
+    fflush(qacount_file);
+}
+
+static void qacount_log_view(uint32_t view_cookie, uint32_t resource_cookie)
+{
+    qacount_open();
+    if (!qacount_file)
+        return;
+    pthread_mutex_lock(&qacount_lock);
+    fprintf(qacount_file, "CV\t%u\t%u\n", view_cookie, resource_cookie);
+    pthread_mutex_unlock(&qacount_lock);
+}
+
 static void *vkd3d_descriptor_debug_qa_check_entry(void *userdata)
 {
     struct vkd3d_descriptor_qa_global_info *global_info = userdata;
+    static unsigned int reports;
     bool active = true;
 
+    qacount_open();
     while (active)
     {
         /* Don't spin endlessly, this thread is kicked after a successful fence wait. */
@@ -364,10 +437,16 @@ static void *vkd3d_descriptor_debug_qa_check_entry(void *userdata)
         active = global_info->active;
         pthread_mutex_unlock(&global_info->ring_lock);
 
+        qacount_snapshot(global_info);
+
         if (global_info->payload_data->fault_type != 0)
         {
-            vkd3d_descriptor_debug_qa_check_report_fault(global_info);
-            ERR("Num failed checks: %u\n", global_info->payload_data->fault_atomic);
+            /* miles-bench: the counting build only wants the first few fault reports. */
+            if (reports++ < 20)
+            {
+                vkd3d_descriptor_debug_qa_check_report_fault(global_info);
+                ERR("Num failed checks: %u\n", global_info->payload_data->fault_atomic);
+            }
 
             /* Reset the latch so we can get more reports. */
             vkd3d_atomic_uint32_store_explicit(&global_info->payload_data->fault_type, 0, vkd3d_memory_order_relaxed);
@@ -679,7 +758,8 @@ static HRESULT vkd3d_descriptor_debug_alloc_global_info_descriptors(
     memset(&buffer_desc, 0, sizeof(buffer_desc));
     buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer_desc.Width = sizeof(uint32_t) * ((num_cookies + 31) / 32) +
-            offsetof(struct vkd3d_descriptor_qa_global_buffer_data, live_status_table);
+            offsetof(struct vkd3d_descriptor_qa_global_buffer_data, live_status_table) +
+            sizeof(uint32_t) * VKD3D_DESCRIPTOR_QA_COUNT_SLOTS;
     buffer_desc.Height = 1;
     buffer_desc.DepthOrArraySize = 1;
     buffer_desc.MipLevels = 1;
@@ -701,14 +781,19 @@ static HRESULT vkd3d_descriptor_debug_alloc_global_info_descriptors(
         return hr;
     }
 
-    memory_properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-#ifdef VKD3D_ENABLE_BREADCRUMBS
-    memory_properties = vkd3d_debug_buffer_memory_properties(device, memory_properties, false);
-#endif
-
+    /* miles-bench: every descriptor access does an atomic add on the payload, so keep it in VRAM
+     * (the BAR window) when possible; atomics over PCIe would crawl. */
+    memory_properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, global_info->vk_payload_buffer,
-            memory_properties, 0,
-            &global_info->payload_device_allocation)))
+            memory_properties, 0, &global_info->payload_device_allocation)))
+    {
+        ERR("qacount: no device-local host-visible memory for the payload, using system memory.\n");
+        memory_properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        hr = vkd3d_allocate_internal_buffer_memory(device, global_info->vk_payload_buffer,
+                memory_properties, 0, &global_info->payload_device_allocation);
+    }
+    if (FAILED(hr))
     {
         vkd3d_descriptor_debug_free_global_info(global_info, device);
         return hr;
@@ -1016,6 +1101,7 @@ void vkd3d_descriptor_debug_register_view_cookie(
     DECL_BUFFER();
 
     vkd3d_descriptor_debug_set_live_status_bit(global_info, cookie);
+    qacount_log_view(cookie.index, resource_cookie.index);
 
     if (!vkd3d_descriptor_debug_active_log())
         return;

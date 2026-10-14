@@ -1134,6 +1134,11 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     if (PresentFlags & DXGI_PRESENT_TEST)
         return S_OK;
 
+    vkd3d_engine_present();
+    vkd3d_frametrace_present();
+    vkd3d_index_cache_present();
+    vkd3d_gputime_present();
+
     assert(chain->user.index < chain->desc.BufferCount);
 
     /* The present iteration on present thread has a similar counter and it will pick up the request from the ring. */

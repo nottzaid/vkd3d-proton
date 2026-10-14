@@ -37,6 +37,8 @@
 
 #include "debug.h"
 
+void vkd3d_lightgrid_hook_budget(IUnknown *adapter);
+
 #if defined(__WINE__) || !defined(_WIN32)
 #define DLLEXPORT __attribute__((visibility("default")))
 #include <dlfcn.h>
@@ -679,6 +681,9 @@ static HRESULT STDMETHODCALLTYPE d3d12core_CreateDeviceFromFactory(
         WARN("Failed to get adapter desc, hr %#x.\n", (int)hr);
         goto out_release_adapter;
     }
+
+    /* miles-bench lightgrid.c: the game's VRAM budget leaves room for the light grid to grow. */
+    vkd3d_lightgrid_hook_budget((IUnknown *)dxgi_adapter);
 
     passthrough_unix_environment("VKD3D_UNIX_ENV");
 #else
