@@ -194,7 +194,10 @@ static VkDeviceMemory skin_alloc_memory(VkDeviceSize size, uint32_t type)
 }
 
 /* Back half h up to (not including) byte `target`. Called with skin_lock held. */
-static void skin_grow(unsigned int h, uint32_t target)
+static uint32_t skin_target(uint32_t end);
+
+/* `demand`: allocations are about to reach the backing (not the backing a new buffer starts with). */
+static void skin_grow(unsigned int h, uint32_t target, bool demand)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &skin.device->vk_procs;
     uint64_t t0 = vkd3d_get_current_time_ns();
@@ -237,6 +240,13 @@ static void skin_grow(unsigned int h, uint32_t target)
         skin.chunks[skin.chunk_count++] = memory;
         vkd3d_atomic_uint32_store_explicit(&skin.bound[h], skin.bound[h] + count, vkd3d_memory_order_release);
     }
+    if (failed)
+    {
+        /* As in lightgrid_grow: keep wanting only what is in use, and tell the streamer. */
+        skin.wanted[h] = max(skin.bound[h], skin_target(skin.highest[h]));
+        if (demand)
+            vkd3d_bench_hold_raise(min(SKIN_CHUNK, target - skin.bound[h]));
+    }
     skin.grows++;
     skin.grow_ns += vkd3d_get_current_time_ns() - t0;
     vkd3d_frametrace_event("skin grow %s %.3f ms half %u %#x -> %#x, target %#x, highest %#x, system memory %u MiB",
@@ -272,7 +282,7 @@ static void skin_ensure(unsigned int h, uint32_t end)
         }
         if ((uint64_t)end + skin_margin / 2 > skin.bound[h] &&
                 (end > skin.bound[h] || vkd3d_get_current_time_ns() >= skin.retry_at))
-            skin_grow(h, skin_target(end));
+            skin_grow(h, skin_target(end), true);
         if ((end > skin.bound[h]) != skin.in_loss[h])
         {
             skin.in_loss[h] = !skin.in_loss[h];
@@ -429,7 +439,7 @@ HRESULT vkd3d_skinbuf_create_placed(struct d3d12_device *device, struct d3d12_he
     const char *source = "setup failed";
     VkFenceCreateInfo fence_info;
     uint32_t type_bits, first;
-    uint64_t learned;
+    uint64_t learned = 0, reserve;
     uint8_t *image;
     HRESULT hr;
 
@@ -488,18 +498,22 @@ HRESULT vkd3d_skinbuf_create_placed(struct d3d12_device *device, struct d3d12_he
             first = skin_target(skin_initial > skin_margin ? skin_initial - skin_margin : 0);
             source = "VKD3D_BENCH_SKIN_INITIAL_MB";
         }
-        else if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_SKIN_BYTES, &learned) && learned)
+        else if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_SKIN_BYTES, &learned) && learned &&
+                vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_RESERVE_BYTES, &reserve))
         {
             first = skin_target((uint32_t)min(learned, (uint64_t)skin.half_size));
             source = "learned peak + margin";
         }
         else
         {
+            /* Backing only what earlier sessions used saves VRAM where VRAM runs short; a machine
+             * where it never ran short (no reserve learned) gains nothing from it and would only
+             * risk a growth that finds no VRAM in a scene no earlier session reached. */
             first = skin.half_size;
-            source = "nothing learned yet: all of it";
+            source = learned ? "VRAM never ran short here: all of it" : "nothing learned yet: all of it";
         }
-        skin_grow(0, first);
-        skin_grow(1, first);
+        skin_grow(0, first, false);
+        skin_grow(1, first, false);
     }
     pthread_mutex_unlock(&skin_lock);
 
@@ -536,7 +550,7 @@ void vkd3d_skinbuf_update(void)
                 vkd3d_bench_learned_raise(VKD3D_BENCH_LEARNED_SKIN_BYTES, used);
             }
             if (vkd3d_get_current_time_ns() >= skin.retry_at)
-                skin_grow(h, skin_target(used));
+                skin_grow(h, skin_target(used), true);
         }
         pthread_mutex_unlock(&skin_lock);
     }

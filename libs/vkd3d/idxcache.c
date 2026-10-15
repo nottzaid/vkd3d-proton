@@ -81,6 +81,7 @@ static struct
     size_t pending_count, pending_size;
     uint64_t hits, misses, full, bytes, stale, invalidations, verified, mismatched;
     uint64_t *run_copied; /* per cache page, at a run's first page: present count of the copy */
+    uint64_t submit_checks;
     /* The present count of the last failed allocation and the smallest run size that failed in it:
      * within one present nothing becomes evictable (run_last only grows), so any run at least that
      * big fails again; it is refused without rescanning the ring. */
@@ -140,7 +141,8 @@ bool vkd3d_index_cache_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC
         INFO("idxcache: the engine's geometry writes are not hooked; no index cache.\n");
         return false;
     }
-    if (d3d12_device_is_uma(device, NULL))
+    if (d3d12_device_is_uma(device, NULL) ||
+            device->device_info.properties2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
     {
         INFO("idxcache: CPU and GPU share memory; no index cache.\n");
         return false;
@@ -360,7 +362,7 @@ static int32_t idxc_alloc_locked(uint32_t pages)
 /* The draw reads [offset, offset + size) of `buffer`. On success, bind *out_buffer at *out_offset
  * with firstIndex 0 instead. */
 bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
-        VkBuffer *out_buffer, VkDeviceSize *out_offset)
+        VkBuffer *out_buffer, VkDeviceSize *out_offset, struct vkd3d_index_cache_use *use)
 {
     VkDeviceSize rel, end, run_start;
     struct idxc_entry *e;
@@ -451,8 +453,69 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
     *out_buffer = idxc.cache.resource.vk_buffer;
     *out_offset = idxc.cache.offset + ((VkDeviceSize)(e->slot - 1) << idxc_page_shift) +
             (rel - ((VkDeviceSize)p0 << idxc_page_shift));
+    if (use)
+    {
+        use->first_page = p0;
+        use->pages = pages;
+        use->slot = e->slot;
+        use->gen = idxc.run_gen[e->slot - 1];
+        use->frame = __atomic_load_n(&idxc_frame, __ATOMIC_RELAXED);
+    }
     pthread_mutex_unlock(&idxc_lock);
     return true;
+}
+
+bool vkd3d_index_cache_verifying(void)
+{
+    return idxc_verify;
+}
+
+/* VKD3D_BENCH_INDEX_CACHE_VERIFY=1, at ExecuteCommandLists: the cached runs a list's draws were
+ * recorded against must still be what they were. The verify at lookup compares bytes when the draw
+ * is recorded; this catches what happens between recording and submission (stock reads the source
+ * when the GPU runs the list): a CPU write to the source pages (the draw would read stale indices),
+ * or the run evicted and reused (other indices), or a list submitted so long after it was recorded
+ * that the run may be reused while the GPU still reads it. */
+void vkd3d_index_cache_check_submit(const struct vkd3d_index_cache_use *uses, size_t count)
+{
+    static uint64_t checked, written, evicted, late;
+    uint64_t frame = __atomic_load_n(&idxc_frame, __ATOMIC_RELAXED);
+    const struct vkd3d_index_cache_use *u;
+    size_t i;
+    uint32_t j;
+
+    pthread_mutex_lock(&idxc_lock);
+    for (i = 0; i < count && idxc.table; i++)
+    {
+        u = &uses[i];
+        checked++;
+        if (idxc.table[u->first_page].slot != u->slot || idxc.run_gen[u->slot - 1] != u->gen ||
+                idxc.run_of[u->slot - 1] != (int32_t)(u->slot - 1))
+        {
+            if (!evicted++)
+                ERR("idxcache verify: a run a draw was recorded against was evicted before the list was submitted.\n");
+        }
+        else
+        {
+            for (j = 0; j < u->pages; j++)
+            {
+                if (idxc.page_gen[u->first_page + j] > u->gen)
+                {
+                    if (!written++)
+                        ERR("idxcache verify: indices were written after a draw reading them was recorded "
+                                "and before its list was submitted.\n");
+                    break;
+                }
+            }
+        }
+        if (frame >= u->frame + IDXC_REUSE_FRAMES / 2 && !late++)
+            ERR("idxcache verify: a list was submitted %"PRIu64" presents after a cached draw was recorded.\n",
+                    frame - u->frame);
+    }
+    if (!(checked & 0xfffff) || (count && !(++idxc.submit_checks & 0xfff)))
+        INFO("idxcache verify: %"PRIu64" cached draws checked at submission: %"PRIu64" source written since, "
+                "%"PRIu64" run evicted, %"PRIu64" submitted late.\n", checked, written, evicted, late);
+    pthread_mutex_unlock(&idxc_lock);
 }
 
 /* Start of every ExecuteCommandLists, before the memory transfer queue is flushed. */

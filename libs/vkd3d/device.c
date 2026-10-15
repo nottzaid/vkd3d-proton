@@ -11559,6 +11559,21 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     if (FAILED(hr = vkd3d_create_vk_device(device, create_info)))
         goto out_free_fragment_output_lock;
+    /* miles-bench: the VRAM reserve, the budget hold and the index cache are for discrete GPUs. */
+    vkd3d_bench_set_gpu_type(device->device_info.properties2.properties.deviceType);
+    /* miles-bench: learned values belong to this GPU and its amount of VRAM (learned.c). */
+    {
+        VkDeviceSize vram = 0;
+        unsigned int i;
+
+        for (i = 0; i < device->memory_properties.memoryHeapCount; i++)
+        {
+            if (device->memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                vram = max(vram, device->memory_properties.memoryHeaps[i].size);
+        }
+        vkd3d_bench_learned_device(device->device_info.properties2.properties.vendorID,
+                device->device_info.properties2.properties.deviceID, vram);
+    }
 
     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))
         goto out_free_vk_resources;

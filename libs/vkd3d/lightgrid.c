@@ -222,8 +222,11 @@ static VkDeviceMemory lightgrid_alloc(VkDeviceSize size, uint32_t type)
     return memory;
 }
 
-/* Back pages up to (not including) target. Called with lightgrid_lock held. */
-static void lightgrid_grow(uint32_t target)
+static uint32_t lightgrid_target(int32_t highest);
+
+/* Back pages up to (not including) target. Called with lightgrid_lock held. `demand`: pages in use
+ * are about to reach the backing (not the backing a new buffer starts with). */
+static void lightgrid_grow(uint32_t target, bool demand)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &lightgrid.device->vk_procs;
     uint64_t t0 = vkd3d_get_current_time_ns();
@@ -266,6 +269,16 @@ static void lightgrid_grow(uint32_t target)
         lightgrid.chunks[lightgrid.chunk_count++] = memory;
         lightgrid.bound += count;
     }
+    if (failed)
+    {
+        /* Only what the pages in use need stays wanted, so the budget hook does not hide a whole
+         * initial backing that did not fit for the rest of the session. A growth the game needs
+         * that found no VRAM is a failed VRAM allocation like any other: the streamer is told to
+         * make room (vkd3d_bench_hold_raise). */
+        lightgrid.wanted = max(lightgrid.bound, lightgrid_target(lightgrid_highest()));
+        if (demand)
+            vkd3d_bench_hold_raise((VkDeviceSize)min(LIGHTGRID_CHUNK_PAGES, target - lightgrid.bound) * LIGHTGRID_PAGE);
+    }
     lightgrid.grows++;
     lightgrid.grow_ns += vkd3d_get_current_time_ns() - t0;
     vkd3d_frametrace_event("lightgrid grow %s %.3f ms pages %u -> %u, target %u, highest %u, system memory +%u pages",
@@ -291,7 +304,7 @@ HRESULT vkd3d_lightgrid_create_placed(struct d3d12_device *device, struct d3d12_
     VkFenceCreateInfo fence_info;
     uint32_t pages, type_bits, initial;
     const char *source = "setup failed";
-    uint64_t learned;
+    uint64_t learned = 0, reserve;
     HRESULT hr;
 
     pages = heap->desc.SizeInBytes / LIGHTGRID_PAGE;
@@ -351,18 +364,20 @@ HRESULT vkd3d_lightgrid_create_placed(struct d3d12_device *device, struct d3d12_
             initial = min(lightgrid_initial, pages - 1);
             source = "VKD3D_BENCH_LIGHTGRID_INITIAL";
         }
-        else if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_LIGHTGRID_PAGES, &learned) && learned)
+        else if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_LIGHTGRID_PAGES, &learned) && learned &&
+                vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_RESERVE_BYTES, &reserve))
         {
             initial = lightgrid_target((int32_t)min(learned, (uint64_t)pages - 1) - 1);
             source = "learned peak + margin";
         }
         else
         {
+            /* As for the skinning buffer: lazy backing only where VRAM has run short before. */
             initial = pages - 1;
-            source = "nothing learned yet: every page";
+            source = learned ? "VRAM never ran short here: every page" : "nothing learned yet: every page";
         }
         lightgrid.highest_seen = max(lightgrid_highest(), 0);
-        lightgrid_grow(max(initial, lightgrid_target(lightgrid_highest())));
+        lightgrid_grow(max(initial, lightgrid_target(lightgrid_highest())), false);
     }
     pthread_mutex_unlock(&lightgrid_lock);
 
@@ -403,7 +418,7 @@ void vkd3d_lightgrid_update(void)
         target = lightgrid_target(highest);
         now = vkd3d_get_current_time_ns();
         if (target > lightgrid.bound && (now >= lightgrid.retry_at || highest >= (int32_t)lightgrid.bound))
-            lightgrid_grow(target);
+            lightgrid_grow(target, true);
         if ((highest >= (int32_t)lightgrid.bound) != lightgrid.in_loss)
         {
             lightgrid.in_loss = !lightgrid.in_loss;
@@ -537,6 +552,7 @@ static HRESULT STDMETHODCALLTYPE lightgrid_query_video_memory_info_hook(IUnknown
     pthread_once(&bench_hold_once, bench_hold_init);
     hr = lightgrid_query_original(iface, node, segment_group, info);
     if (SUCCEEDED(hr) && info && segment_group == 0 /* DXGI_MEMORY_SEGMENT_GROUP_LOCAL */ &&
+            !vkd3d_bench_gpu_integrated() &&
             (reserve = max(vkd3d_lightgrid_budget_reserve() + vkd3d_skinbuf_budget_reserve(),
             __atomic_load_n(&bench_hold, __ATOMIC_RELAXED))))
     {

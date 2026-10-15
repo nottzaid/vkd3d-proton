@@ -4433,6 +4433,9 @@ void d3d12_command_list_debug_mark_end_region(struct d3d12_command_list *list)
     d3d12_command_list_debug_mark_end_region_cmd(list, list->cmd.vk_command_buffer);
 }
 
+static bool d3d12_command_list_ck_clear_keep(struct d3d12_command_list *list, struct d3d12_resource *resource,
+        VkImageAspectFlags aspects);
+
 static void d3d12_command_list_load_attachment(struct d3d12_command_list *list, struct d3d12_resource *resource,
         struct vkd3d_view *view, VkImageAspectFlags clear_aspects, const VkClearValue *clear_value, UINT rect_count,
         const D3D12_RECT *rects, VkAttachmentLoadOp load_op)
@@ -4449,7 +4452,7 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list, 
     bool separate_ds_layouts;
     VkExtent3D view_extent;
     VkAccessFlags2 access;
-    bool clear_op;
+    bool clear_op, kept;
 
     /* This does not get called with LOAD_OP_LOAD */
     list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
@@ -4570,8 +4573,14 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list, 
          * Discarding with UNDEFINED is required to handle placed resources, however.
          * Also, if we're going to perform layout transitions anyways (for DSV),
          * might as well discard. */
-        requires_discard_barrier = d3d12_resource_may_alias_other_resources(resource);
-        if (separate_ds_layouts)
+        /* miles-bench clear keep: a kept clear changes layout (if it must) from the layout the image
+         * has, like any other render pass on it; the clear then replaces the contents. */
+        kept = d3d12_resource_may_alias_other_resources(resource) &&
+                d3d12_command_list_ck_clear_keep(list, resource, clear_aspects);
+        requires_discard_barrier = d3d12_resource_may_alias_other_resources(resource) && !kept;
+        if (kept)
+            ;
+        else if (separate_ds_layouts)
         {
             if (initial_layouts[0] != rp_layouts[0] || initial_layouts[1] != rp_layouts[1])
                 requires_discard_barrier = true;
@@ -4760,6 +4769,347 @@ static VkPipelineStageFlags2 vk_queue_shader_stages(struct d3d12_device *device,
 static void d3d12_command_list_discard_attachment(struct d3d12_command_list *list,
         struct d3d12_resource *resource, const VkImageSubresourceRange *subresources);
 
+/* miles-bench clear keep (VKD3D_BENCH_CLEAR_KEEP=1; features bit 0x1000 switches it live).
+ *
+ * vkd3d transitions every full clear of a placed render target from UNDEFINED, because another
+ * resource placed over the same memory may have written it since (D3D12 aliasing). NVIDIA spends
+ * real time on that transition (~120-280 us a frame on the G-buffer alone): the engine keeps each
+ * G-buffer target in a heap of its own together with its dynamic-resolution variants, all at
+ * offset 0, so every one of them may alias. The transition is only needed when the memory was last
+ * written through another resource; for committed resources vkd3d never does it.
+ *
+ * A heap qualifies while everything ever placed in it is a single-subresource render target or
+ * depth buffer (UAV access allowed, simultaneous access not) and none of its memory was mapped to a
+ * tiled resource. D3D12 requires the first operation on such a texture after another resource used
+ * its memory to be a Clear, DiscardResource or a copy into it (CreatePlacedResource, "notes on the
+ * required resource initialization"); those and every other command vkd3d sees touching a resource
+ * (render passes, clears, discards, copies, resolves, barriers) pass
+ * d3d12_command_list_track_resource_usage. So a change of the resource that owns the memory is
+ * always visible there, and writes vkd3d cannot see (UAV access through descriptors) only come from
+ * the owner. Each such use of a resource in a list is an event on its heap (reads count too:
+ * conservative). Every submitted list replays
+ * its events in submission order, which gives the heap's owner in GPU order. A full clear keeps the
+ * layout instead of transitioning from UNDEFINED only if
+ *   - the heap's owner after everything submitted so far is the cleared resource, and a full clear
+ *     of it transitioned from UNDEFINED since it became the owner (the first initialization of a
+ *     placed target may be a discard that keeps its layout: VKD3D_BENCH_DISCARD_KEEP),
+ *   - no other recorded but unsubmitted list has used the heap (it could be submitted first),
+ *   - nothing else in this list used the heap before the clear.
+ * A list recorded after such a clear that uses the heap through another resource could still be
+ * submitted before it (lists submitted in another order than recorded). The replay checks every
+ * kept clear against the GPU-order owner when its list is submitted: a mismatch is an ERR and turns
+ * the feature off for the session. */
+struct vkd3d_ck_heap
+{
+    uint64_t gpu_owner;  /* resource id of the last event submitted (0 = none) */
+    uint64_t gpu_inited; /* gpu_owner if a clear transitioned it from UNDEFINED since it became owner */
+    uint32_t pending;    /* lists recorded with events on it, not yet submitted or reset */
+    uint32_t refs;       /* lists holding events on it (until reset or destroyed) */
+    const struct d3d12_command_queue *queue; /* the queue its lists are submitted to */
+    bool ineligible;     /* see vkd3d_bench_ck_placed and the callers that set it */
+    bool had_kept;       /* a kept clear or discard on it was recorded */
+    bool heap_destroyed; /* freed once no list refers to it */
+};
+
+enum vkd3d_ck_kind
+{
+    VKD3D_CK_USE,  /* any use */
+    VKD3D_CK_INIT, /* a full clear or discard transitioned from UNDEFINED */
+    VKD3D_CK_KEPT, /* a full clear or discard kept the layout */
+};
+
+struct vkd3d_ck_event
+{
+    struct vkd3d_ck_heap *heap;
+    uint64_t id;
+    enum vkd3d_ck_kind kind;
+};
+
+/* A heap a list used: the resources it used it through, so far. */
+struct vkd3d_ck_list_heap
+{
+    struct vkd3d_ck_heap *heap;
+    uint64_t first_id, last_id;
+    bool mixed; /* used through more than one resource */
+};
+
+static pthread_mutex_t vkd3d_ck_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t vkd3d_ck_next_id;
+static int vkd3d_ck_enabled = -1;
+static bool vkd3d_ck_off; /* a kept clear could not be proven in GPU order */
+static uint64_t vkd3d_ck_kept, vkd3d_ck_transitioned, vkd3d_ck_violations;
+
+static bool vkd3d_ck_wanted(void)
+{
+    char env[8];
+
+    if (vkd3d_ck_enabled < 0)
+        vkd3d_ck_enabled = vkd3d_get_env_var("VKD3D_BENCH_CLEAR_KEEP", env, sizeof(env)) && env[0] == '1';
+    return vkd3d_ck_enabled;
+}
+
+/* With vkd3d_ck_lock held. */
+static void vkd3d_ck_violation(const char *what)
+{
+    if (!vkd3d_ck_violations++)
+        ERR("bench: clear keep: %s; clear keep is off for the rest of the session.\n", what);
+    vkd3d_ck_off = true;
+}
+
+/* Memory another process or device can write (shared heaps, heaps opened from a handle or an
+ * address) never qualifies. */
+void vkd3d_bench_ck_heap_created(struct d3d12_heap *heap, bool external)
+{
+    if (!vkd3d_ck_wanted())
+        return;
+    if ((heap->bench_ck = vkd3d_calloc(1, sizeof(*heap->bench_ck))) &&
+            (external || (heap->desc.Flags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER))))
+        heap->bench_ck->ineligible = true;
+}
+
+void vkd3d_bench_ck_heap_destroyed(struct d3d12_heap *heap)
+{
+    struct vkd3d_ck_heap *ck = heap->bench_ck;
+
+    if (!ck)
+        return;
+    pthread_mutex_lock(&vkd3d_ck_lock);
+    ck->heap_destroyed = true;
+    if (!ck->refs)
+        vkd3d_free(ck);
+    pthread_mutex_unlock(&vkd3d_ck_lock);
+    heap->bench_ck = NULL;
+}
+
+/* With vkd3d_ck_lock held: the heap stops qualifying. A kept clear already recorded on it can
+ * still be proven by the replay only if nothing that can now write it unseen runs first. */
+static void vkd3d_ck_disqualify(struct vkd3d_ck_heap *ck, const char *why)
+{
+    if (!ck->ineligible && ck->had_kept)
+        vkd3d_ck_violation(why);
+    __atomic_store_n(&ck->ineligible, true, __ATOMIC_RELEASE);
+}
+
+/* Tiles of the heap were mapped to a reserved resource: its memory can be written through it. */
+void vkd3d_bench_ck_heap_tiled(struct d3d12_heap *heap)
+{
+    if (!heap || !heap->bench_ck)
+        return;
+    pthread_mutex_lock(&vkd3d_ck_lock);
+    vkd3d_ck_disqualify(heap->bench_ck, "a heap with kept clears was mapped to a tiled resource");
+    pthread_mutex_unlock(&vkd3d_ck_lock);
+}
+
+void vkd3d_bench_ck_placed(struct d3d12_heap *heap, struct d3d12_resource *resource)
+{
+    const D3D12_RESOURCE_DESC1 *desc = &resource->desc;
+
+    if (!heap->bench_ck)
+        return;
+    resource->bench_ck_id = __atomic_add_fetch(&vkd3d_ck_next_id, 1, __ATOMIC_RELAXED);
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->MipLevels != 1 ||
+            desc->DepthOrArraySize != 1 || desc->SampleDesc.Count != 1 ||
+            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) ||
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
+            d3d12_resource_get_sub_resource_count(resource) != 1)
+    {
+        pthread_mutex_lock(&vkd3d_ck_lock);
+        vkd3d_ck_disqualify(heap->bench_ck, "a resource that is not a plain render target was placed in a heap with kept clears");
+        pthread_mutex_unlock(&vkd3d_ck_lock);
+    }
+}
+
+static struct vkd3d_ck_heap *d3d12_resource_ck_heap(struct d3d12_resource *resource)
+{
+    return resource && (resource->flags & VKD3D_RESOURCE_PLACED) && resource->heap && resource->bench_ck_id ?
+            resource->heap->bench_ck : NULL;
+}
+
+/* With vkd3d_ck_lock held: the list's record of the heap, made on its first event there (the list
+ * is then pending on the heap). NULL if out of memory; the heap then no longer qualifies. */
+static struct vkd3d_ck_list_heap *d3d12_command_list_ck_heap(struct d3d12_command_list *list,
+        struct vkd3d_ck_heap *ck, uint64_t id)
+{
+    struct vkd3d_ck_list_heap *h;
+    size_t i;
+
+    for (i = 0; i < list->bench_ck_heap_count; i++)
+        if (list->bench_ck_heaps[i].heap == ck)
+            return &list->bench_ck_heaps[i];
+    if (!vkd3d_array_reserve((void **)&list->bench_ck_heaps, &list->bench_ck_heaps_size,
+            list->bench_ck_heap_count + 1, sizeof(*list->bench_ck_heaps)))
+    {
+        vkd3d_ck_disqualify(ck, "out of memory tracking a heap with kept clears");
+        return NULL;
+    }
+    h = &list->bench_ck_heaps[list->bench_ck_heap_count++];
+    h->heap = ck;
+    h->first_id = id;
+    h->last_id = 0; /* nothing stored yet (ids start at 1) */
+    h->mixed = false;
+    ck->pending++;
+    ck->refs++;
+    return h;
+}
+
+/* With vkd3d_ck_lock held. A use repeating the list's last use of the heap (same resource) changes
+ * nothing in the replay and is not stored. */
+static bool d3d12_command_list_ck_add_event(struct d3d12_command_list *list, struct vkd3d_ck_heap *ck,
+        uint64_t id, enum vkd3d_ck_kind kind)
+{
+    struct vkd3d_ck_list_heap *h;
+    bool repeat;
+
+    if (!(h = d3d12_command_list_ck_heap(list, ck, id)))
+        return false;
+    repeat = h->last_id == id;
+    if (id != h->first_id)
+        h->mixed = true;
+    h->last_id = id;
+    if (kind == VKD3D_CK_USE && repeat)
+        return true;
+    if (!vkd3d_array_reserve((void **)&list->bench_ck_events, &list->bench_ck_events_size,
+            list->bench_ck_event_count + 1, sizeof(*list->bench_ck_events)))
+    {
+        /* Without the event the replay would miss a use. */
+        vkd3d_ck_disqualify(ck, "out of memory tracking a heap with kept clears");
+        return false;
+    }
+    list->bench_ck_events[list->bench_ck_event_count].heap = ck;
+    list->bench_ck_events[list->bench_ck_event_count].id = id;
+    list->bench_ck_events[list->bench_ck_event_count++].kind = kind;
+    if (kind == VKD3D_CK_KEPT)
+        ck->had_kept = true;
+    return true;
+}
+
+/* Every use of a resource in a list (d3d12_command_list_track_resource_usage). */
+static void d3d12_command_list_ck_use(struct d3d12_command_list *list, struct d3d12_resource *resource)
+{
+    struct vkd3d_ck_heap *ck;
+
+    if (!(ck = d3d12_resource_ck_heap(resource)) || __atomic_load_n(&ck->ineligible, __ATOMIC_ACQUIRE))
+        return;
+    pthread_mutex_lock(&vkd3d_ck_lock);
+    if (list->type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        vkd3d_ck_disqualify(ck, "a heap with kept clears is used from a non-direct list");
+    else
+        d3d12_command_list_ck_add_event(list, ck, resource->bench_ck_id, VKD3D_CK_USE);
+    pthread_mutex_unlock(&vkd3d_ck_lock);
+}
+
+/* A full clear (or discard) of `aspects` of `resource` is about to be recorded with a transition
+ * from UNDEFINED because the resource may alias others. True if the transition can be left out
+ * (see above); either way the clear is recorded as an event. Only one covering every aspect
+ * initializes the resource. */
+static bool d3d12_command_list_ck_clear_keep(struct d3d12_command_list *list, struct d3d12_resource *resource,
+        VkImageAspectFlags aspects)
+{
+    const struct vkd3d_ck_list_heap *h = NULL;
+    struct vkd3d_ck_heap *ck;
+    bool keep;
+    size_t i;
+
+    if (!(ck = d3d12_resource_ck_heap(resource)) || __atomic_load_n(&ck->ineligible, __ATOMIC_ACQUIRE))
+        return false;
+    pthread_mutex_lock(&vkd3d_ck_lock);
+    for (i = 0; i < list->bench_ck_heap_count && !h; i++)
+        if (list->bench_ck_heaps[i].heap == ck)
+            h = &list->bench_ck_heaps[i];
+    /* Nothing but this resource used the heap earlier in this list, nothing submitted since this
+     * resource was initialized used it, and no other recorded list waits to be submitted with a
+     * use of it. */
+    keep = !vkd3d_ck_off && !ck->ineligible && list->type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+            (vkd3d_bench_features() & VKD3D_BENCH_FEATURE_CLEAR_KEEP) &&
+            (!h || (!h->mixed && h->first_id == resource->bench_ck_id)) &&
+            ck->gpu_owner == resource->bench_ck_id && ck->gpu_inited == resource->bench_ck_id &&
+            ck->pending == (h ? 1u : 0u);
+    if (!d3d12_command_list_ck_add_event(list, ck, resource->bench_ck_id, keep ? VKD3D_CK_KEPT :
+            (aspects & resource->format->vk_aspect_mask) == resource->format->vk_aspect_mask ? VKD3D_CK_INIT : VKD3D_CK_USE))
+        keep = false;
+    if (keep)
+        vkd3d_ck_kept++;
+    else
+        vkd3d_ck_transitioned++;
+    pthread_mutex_unlock(&vkd3d_ck_lock);
+    return keep;
+}
+
+/* Reset or destroyed: the list lets go of the heaps it used (events of a list that was never
+ * submitted never reached the GPU and are simply dropped). */
+static void d3d12_command_list_ck_reset(struct d3d12_command_list *list)
+{
+    struct vkd3d_ck_heap *ck;
+    size_t i;
+
+    if (!list->bench_ck_event_count && !list->bench_ck_heap_count)
+        return;
+    pthread_mutex_lock(&vkd3d_ck_lock);
+    for (i = 0; i < list->bench_ck_heap_count; i++)
+    {
+        ck = list->bench_ck_heaps[i].heap;
+        if (!list->bench_ck_submitted)
+            ck->pending--;
+        if (!--ck->refs && ck->heap_destroyed)
+            vkd3d_free(ck);
+    }
+    list->bench_ck_event_count = 0;
+    list->bench_ck_heap_count = 0;
+    list->bench_ck_submitted = false;
+    pthread_mutex_unlock(&vkd3d_ck_lock);
+}
+
+/* ExecuteCommandLists, in submission order: replay the list's events (a list may be executed more
+ * than once). Every kept clear must find its resource owning and initialized in GPU order. */
+static void d3d12_command_list_ck_submit(struct d3d12_command_list *list, const struct d3d12_command_queue *queue)
+{
+    const struct vkd3d_ck_event *e;
+    struct vkd3d_ck_heap *ck;
+    size_t i;
+
+    if (!list->bench_ck_event_count)
+        return;
+    pthread_mutex_lock(&vkd3d_ck_lock);
+    for (i = 0; i < list->bench_ck_event_count; i++)
+    {
+        e = &list->bench_ck_events[i];
+        ck = e->heap;
+        /* Lists on two queues are ordered by fences, not by this replay: one queue per heap. */
+        if (!ck->queue)
+            ck->queue = queue;
+        else if (ck->queue != queue)
+            vkd3d_ck_disqualify(ck, "a heap with kept clears is used from a second queue");
+        if (e->kind == VKD3D_CK_KEPT && (ck->ineligible || ck->gpu_owner != e->id || ck->gpu_inited != e->id))
+            vkd3d_ck_violation("a kept clear's memory was used through another resource first in GPU order");
+        if (e->kind == VKD3D_CK_INIT)
+            ck->gpu_inited = e->id;
+        else if (ck->gpu_owner != e->id)
+            ck->gpu_inited = 0;
+        ck->gpu_owner = e->id;
+    }
+    if (!list->bench_ck_submitted)
+    {
+        for (i = 0; i < list->bench_ck_heap_count; i++)
+            list->bench_ck_heaps[i].heap->pending--;
+        list->bench_ck_submitted = true;
+    }
+    pthread_mutex_unlock(&vkd3d_ck_lock);
+}
+
+void vkd3d_bench_clear_keep_log(void)
+{
+    static uint64_t last;
+    uint64_t now;
+
+    if (!vkd3d_ck_wanted() || (now = vkd3d_get_current_time_ns()) - last < 30000000000ull)
+        return;
+    last = now;
+    INFO("clear keep: %"PRIu64" full clears of placed targets kept their layout, %"PRIu64" transitioned from "
+            "UNDEFINED, %"PRIu64" kept clears failed the GPU-order check.\n",
+            __atomic_load_n(&vkd3d_ck_kept, __ATOMIC_RELAXED), __atomic_load_n(&vkd3d_ck_transitioned, __ATOMIC_RELAXED),
+            __atomic_load_n(&vkd3d_ck_violations, __ATOMIC_RELAXED));
+}
+
 static void d3d12_command_list_discard_attachment_barrier(struct d3d12_command_list *list,
         struct d3d12_resource *resource, const VkImageSubresourceRange *subresources, bool is_bound)
 {
@@ -4779,8 +5129,11 @@ static void d3d12_command_list_discard_attachment_barrier(struct d3d12_command_l
         /* miles-bench: a discarded render target is in RENDER_TARGET state, so it already has the
          * attachment layout; the UNDEFINED -> layout barrier only lets the driver drop its
          * contents (NVIDIA spends ~9 us per image on it). Keeping the contents is a valid
-         * "undefined" result. */
-        if (vkd3d_bench_features() & VKD3D_BENCH_FEATURE_DISCARD_KEEP)
+         * "undefined" result, unless another resource wrote the memory since (a placed target:
+         * a discard is how D3D12 activates it after an alias), which clear keep has to rule out. */
+        if ((vkd3d_bench_features() & VKD3D_BENCH_FEATURE_DISCARD_KEEP) &&
+                (!d3d12_resource_may_alias_other_resources(resource) ||
+                d3d12_command_list_ck_clear_keep(list, resource, subresources->aspectMask)))
             return;
 
         stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -5716,7 +6069,8 @@ static void d3d12_command_list_fuse_attachment_clear(struct d3d12_command_list *
         struct d3d12_command_list_barrier_batch *batch)
 {
     VkImageSubresourceRange subresources;
-    bool requires_barrier;
+    bool requires_barrier, kept;
+    VkImageLayout kept_layout;
     VkExtent3D extent;
     unsigned int i;
 
@@ -5796,7 +6150,9 @@ static void d3d12_command_list_fuse_attachment_clear(struct d3d12_command_list *
 
                 /* Full subresource clears of non-committed must transition from UNDEFINED.
                  * Deferred clears only operate on full-subresource clears. */
-                requires_barrier = d3d12_resource_may_alias_other_resources(clear->resource);
+                kept = d3d12_resource_may_alias_other_resources(clear->resource) &&
+                        d3d12_command_list_ck_clear_keep(list, clear->resource, clear_aspects);
+                requires_barrier = d3d12_resource_may_alias_other_resources(clear->resource) && !kept;
 
                 memset(&vk_image_barrier, 0, sizeof(vk_image_barrier));
                 vk_image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -5821,6 +6177,9 @@ static void d3d12_command_list_fuse_attachment_clear(struct d3d12_command_list *
                         stencil_attachment->clearValue = clear->clear_value;
                         plane_write_mask |= VKD3D_STENCIL_PLANE_OPTIMAL;
                     }
+
+                    /* miles-bench clear keep: the layout the image has before the promotion below. */
+                    kept_layout = d3d12_command_list_get_depth_stencil_resource_layout(list, resource, NULL);
 
                     /* It's possible that the PSO uses read-only depth-stencil, but CLEARs happen always,
                      * so we have proved the resource is in DEPTH_WRITE state for the relevant aspects. */
@@ -5857,6 +6216,16 @@ static void d3d12_command_list_fuse_attachment_clear(struct d3d12_command_list *
                         vk_image_barrier.newLayout = (clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
                                 ? vk_separate_depth_layout(vk_image_barrier.newLayout)
                                 : vk_separate_stencil_layout(vk_image_barrier.newLayout);
+                        kept_layout = (clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+                                ? vk_separate_depth_layout(kept_layout) : vk_separate_stencil_layout(kept_layout);
+                    }
+
+                    /* miles-bench clear keep: the promotion, if any, from the layout the image has
+                     * (as the render pass transition would do it), not from UNDEFINED. */
+                    if (kept)
+                    {
+                        vk_image_barrier.oldLayout = kept_layout;
+                        requires_barrier = kept_layout != vk_image_barrier.newLayout;
                     }
 
                     vk_image_barrier.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -6657,6 +7026,9 @@ static void d3d12_command_list_track_resource_usage(struct d3d12_command_list *l
 {
     struct vkd3d_initial_transition transition;
 
+    if (resource && resource->bench_ck_id)
+        d3d12_command_list_ck_use(list, resource);
+
     /* When a command queue has confirmed that it has received a command list for submission, this flag will eventually
      * be cleared. The command queue will only perform the transition once.
      * Until that point, we must keep submitting initial transitions like this. */
@@ -6778,6 +7150,10 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
         vkd3d_free(list->pending_queries);
         vkd3d_free(list->dsv_resource_tracking);
         vkd3d_free(list->subresource_tracking);
+        d3d12_command_list_ck_reset(list);
+        vkd3d_free(list->bench_ck_events);
+        vkd3d_free(list->bench_ck_heaps);
+        vkd3d_free(list->bench_idxc_uses);
         vkd3d_free(list->query_resolves);
         vkd3d_free(list->dgc_batch.draws);
         hash_map_free(&list->query_resolve_lut);
@@ -7348,6 +7724,8 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
 #endif
 
     list->has_replaced_shaders = false;
+    d3d12_command_list_ck_reset(list);
+    list->bench_idxc_use_count = 0;
     list->pdraw.redirect_count = list->pdraw.check_count = 0;
     list->bench_borrowed_bound_count = 0;
     list->bench_borrowed_tables = false;
@@ -9459,10 +9837,16 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
         VkDeviceSize cache_offset;
         VkBuffer cache_buffer;
 
+        struct vkd3d_index_cache_use use;
+        bool verify = vkd3d_index_cache_verifying();
+
         if (start + size <= list->index_buffer.size &&
                 vkd3d_index_cache_lookup(list->index_buffer.buffer, list->index_buffer.offset + start, size,
-                        &cache_buffer, &cache_offset))
+                        &cache_buffer, &cache_offset, verify ? &use : NULL))
         {
+            if (verify && vkd3d_array_reserve((void **)&list->bench_idxc_uses, &list->bench_idxc_uses_size,
+                    list->bench_idxc_use_count + 1, sizeof(*list->bench_idxc_uses)))
+                list->bench_idxc_uses[list->bench_idxc_use_count++] = use;
             VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, cache_buffer, cache_offset, size,
                     list->index_buffer.vk_type));
             list->index_buffer.is_dirty = true; /* the next draw binds the game's buffer again */
@@ -24431,6 +24815,9 @@ static void STDMETHODCALLTYPE d3d12_command_queue_UpdateTileMappings(ID3D12Comma
             iface, resource, region_count, region_coords, region_sizes, heap,
             range_count, range_flags, heap_range_offsets, range_tile_counts, flags);
 
+    /* miles-bench clear keep: the heap's memory can now be written through a tiled resource. */
+    vkd3d_bench_ck_heap_tiled(memory_heap);
+
     /* This can be a fallback sparse resource, just ignore any UpdateTileMapping calls on this. */
     if (!(res->flags & VKD3D_RESOURCE_RESERVED))
     {
@@ -25164,6 +25551,14 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     sub.execute.breadcrumb_indices_count = breadcrumb_indices ? command_list_count : 0;
 #endif
     sub.execute.timeline_cookie = timeline_cookie;
+    /* miles-bench clear keep: the lists' uses reach the GPU in this order (nothing returns early from here). */
+    for (i = 0; i < command_list_count; i++)
+    {
+        cmd_list = unsafe_impl_from_ID3D12CommandList(command_lists[i]);
+        d3d12_command_list_ck_submit(cmd_list, command_queue);
+        if (cmd_list->bench_idxc_use_count)
+            vkd3d_index_cache_check_submit(cmd_list->bench_idxc_uses, cmd_list->bench_idxc_use_count);
+    }
     d3d12_command_queue_add_submission(command_queue, &sub);
 }
 

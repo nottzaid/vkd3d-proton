@@ -1378,6 +1378,7 @@ void vkd3d_engine_present(void)
         *engine_gdec_off = !!(engine_ctl.features & VKD3D_BENCH_FEATURE_GDEC_OFF);
     engine_dropdst_log();
     vkd3d_skinbuf_log();
+    vkd3d_bench_clear_keep_log();
 }
 
 static void engine_patch_init(void)
@@ -1391,6 +1392,8 @@ static void engine_patch_init(void)
 
     if (vkd3d_get_env_var("VKD3D_BENCH_DISCARD_KEEP", patches, sizeof(patches)) && atoi(patches) == 1)
         engine_ctl.features |= VKD3D_BENCH_FEATURE_DISCARD_KEEP;
+    if (vkd3d_get_env_var("VKD3D_BENCH_CLEAR_KEEP", patches, sizeof(patches)) && atoi(patches) == 1)
+        engine_ctl.features |= VKD3D_BENCH_FEATURE_CLEAR_KEEP;
     if (vkd3d_get_env_var("VKD3D_BENCH_COPY_NO_DISCARD", patches, sizeof(patches)))
         engine_ctl.features |= atoi(patches) >= 2 ? VKD3D_BENCH_FEATURE_COPY_KEEP_ALL :
                 atoi(patches) == 1 ? VKD3D_BENCH_FEATURE_COPY_KEEP_SYSMEM : 0;

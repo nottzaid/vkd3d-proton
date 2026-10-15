@@ -89,6 +89,7 @@ static void d3d12_heap_destroy(struct d3d12_heap *heap)
 
     vkd3d_geomirror_unregister(heap);
     vkd3d_index_cache_unregister(heap);
+    vkd3d_bench_ck_heap_destroyed(heap);
     vkd3d_free_memory(heap->device, &heap->device->memory_allocator, &heap->allocation);
     vkd3d_private_store_destroy(&heap->private_store);
     vkd3d_free(heap);
@@ -465,6 +466,7 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
 
     TRACE("Created heap %p.\n", object);
     vkd3d_memtrace_heap_create(device, object);
+    vkd3d_bench_ck_heap_created(object, !!host_address);
 
     *heap = object;
     return S_OK;

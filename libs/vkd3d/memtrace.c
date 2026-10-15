@@ -355,6 +355,21 @@ bool vkd3d_bench_l0_sysmem(struct d3d12_device *device, const D3D12_HEAP_PROPERT
     return l0_sysmem_enabled && !d3d12_device_is_uma(device, NULL);
 }
 
+/* -1 until the first device: whether the GPU has VRAM of its own (VkPhysicalDeviceType DISCRETE). On
+ * an integrated GPU "VRAM" is system memory: nothing to keep free, nothing to cache. */
+static int bench_gpu_discrete = -1;
+
+void vkd3d_bench_set_gpu_type(VkPhysicalDeviceType type)
+{
+    if (bench_gpu_discrete < 0)
+        bench_gpu_discrete = type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+}
+
+bool vkd3d_bench_gpu_integrated(void)
+{
+    return bench_gpu_discrete == 0;
+}
+
 static pthread_once_t vram_reserve_once = PTHREAD_ONCE_INIT;
 static bool vram_reserve_enabled;
 static VkDeviceSize vram_reserve_bytes;
@@ -386,6 +401,11 @@ static void vram_reserve_init(void)
             source = "nothing learned yet; measuring";
     }
     vram_reserve_enabled = !!source;
+    if (vram_reserve_enabled && vkd3d_bench_gpu_integrated())
+    {
+        INFO("bench: not a discrete GPU; no VRAM reserve.\n");
+        vram_reserve_enabled = false;
+    }
     /* Game texture heaps (DEFAULT, texture-only, no RT/DS) mostly hold streamed textures but also a few
      * small UAV textures, so they are only treated as cold on request. */
     vram_reserve_texture_heaps = vkd3d_get_env_var("VKD3D_BENCH_VRAM_RESERVE_TEXHEAPS", value, sizeof(value)) &&

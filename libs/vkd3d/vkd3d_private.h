@@ -1015,6 +1015,7 @@ enum vkd3d_bench_learned
 };
 bool vkd3d_bench_learned_get(enum vkd3d_bench_learned key, uint64_t *value);
 void vkd3d_bench_learned_raise(enum vkd3d_bench_learned key, uint64_t value);
+void vkd3d_bench_learned_device(uint32_t vendor, uint32_t device, uint64_t vram);
 
 bool vkd3d_bench_sparse_buffers(struct d3d12_device *device);
 bool vkd3d_lightgrid_heap_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc);
@@ -1037,6 +1038,14 @@ void vkd3d_skinbuf_update(void);
 void vkd3d_skinbuf_resource_destroyed(struct d3d12_resource *resource);
 uint64_t vkd3d_skinbuf_budget_reserve(void);
 void vkd3d_skinbuf_log(void);
+void vkd3d_bench_clear_keep_log(void);
+struct vkd3d_ck_heap;
+struct vkd3d_ck_event;
+struct vkd3d_ck_list_heap;
+void vkd3d_bench_ck_heap_created(struct d3d12_heap *heap, bool external);
+void vkd3d_bench_ck_heap_destroyed(struct d3d12_heap *heap);
+void vkd3d_bench_ck_heap_tiled(struct d3d12_heap *heap);
+void vkd3d_bench_ck_placed(struct d3d12_heap *heap, struct d3d12_resource *resource);
 void *vkd3d_skinbuf_alloc(void *allocator, int32_t size);
 void *vkd3d_skinbuf_alloc_aligned(void *allocator, int32_t size, int32_t align2);
 void vkd3d_skinbuf_alloc_stub(void);
@@ -1047,8 +1056,15 @@ bool vkd3d_index_cache_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC
 void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *heap);
 void vkd3d_index_cache_unregister(struct d3d12_heap *heap);
 bool vkd3d_index_cache_is_source(VkBuffer buffer);
+struct vkd3d_index_cache_use
+{
+    uint32_t first_page, pages, slot, gen;
+    uint64_t frame;
+};
 bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
-        VkBuffer *out_buffer, VkDeviceSize *out_offset);
+        VkBuffer *out_buffer, VkDeviceSize *out_offset, struct vkd3d_index_cache_use *use);
+bool vkd3d_index_cache_verifying(void);
+void vkd3d_index_cache_check_submit(const struct vkd3d_index_cache_use *uses, size_t count);
 void vkd3d_index_cache_flush(struct d3d12_device *device);
 void vkd3d_index_cache_present(void);
 /* Cache pages held by runs last drawn 0, 1, 2, 3, 4-7 and 8+ presents ago, then free pages (MiB). */
@@ -1121,6 +1137,7 @@ struct d3d12_heap
     struct vkd3d_memory_allocation allocation;
     bool lightgrid; /* lightgrid.c: no memory; the one buffer placed in it is sparse */
     bool skinbuf;   /* skinbuf.c: likewise for the skinning buffer */
+    struct vkd3d_ck_heap *bench_ck; /* command.c clear keep: who last used its memory (VKD3D_BENCH_CLEAR_KEEP) */
 
     priority_info priority;
 
@@ -1265,6 +1282,7 @@ struct d3d12_resource
     D3DKMT_HANDLE kmt_local;
 
     struct d3d12_heap *heap;
+    uint64_t bench_ck_id; /* command.c clear keep: placed in a tracked heap (0 = not tracked) */
 
     uint32_t flags;
 
@@ -3546,6 +3564,15 @@ struct d3d12_command_list
     unsigned int bench_borrowed_bound_count;
     struct d3d12_descriptor_heap *bench_borrowed_bound[4];
     bool bench_borrowed_tables; /* a CBV/SRV/UAV table was set after such a bind */
+    /* miles-bench clear keep (command.c): uses of resources in qualifying heaps, in recording order */
+    struct vkd3d_ck_event *bench_ck_events;
+    size_t bench_ck_event_count, bench_ck_events_size;
+    struct vkd3d_ck_list_heap *bench_ck_heaps;
+    size_t bench_ck_heap_count, bench_ck_heaps_size;
+    bool bench_ck_submitted;
+    /* idxcache.c verify mode: the cached runs this list's draws were recorded against */
+    struct vkd3d_index_cache_use *bench_idxc_uses;
+    size_t bench_idxc_use_count, bench_idxc_uses_size;
     struct vkd3d_dgc_batch dgc_batch;
 
     struct d3d12_command_list_sequence cmd;
@@ -6168,6 +6195,8 @@ VkDeviceSize vkd3d_bench_vram_reserve(const D3D12_HEAP_PROPERTIES *heap_properti
         uint32_t allocation_flags, enum vkd3d_bench_vram_class *vram_class);
 void vkd3d_bench_vram_short(void);
 bool vkd3d_bench_vram_learning(void);
+void vkd3d_bench_set_gpu_type(VkPhysicalDeviceType type);
+bool vkd3d_bench_gpu_integrated(void);
 void vkd3d_bench_vram_headroom(int64_t free, VkDeviceSize size, bool failed);
 void vkd3d_bench_vram_hot(VkDeviceMemory memory, VkDeviceSize size);
 void vkd3d_bench_vram_freed(VkDeviceMemory memory);
@@ -7409,6 +7438,7 @@ void vkd3d_engine_present(void);
 #define VKD3D_BENCH_FEATURE_PDRAW_OFF 0x400u /* particle draws: constants copied the original way */
 #define VKD3D_BENCH_FEATURE_DISCARD_KEEP 0x100u /* DiscardResource on a render target: no UNDEFINED layout barrier */
 #define VKD3D_BENCH_FEATURE_DROPDST_OFF 0x800u /* dropdst patch: no resets of swapped copy destinations */
+#define VKD3D_BENCH_FEATURE_CLEAR_KEEP 0x1000u /* full clears of placed targets keep their layout when nothing else used the memory (command.c clear keep) */
 uint32_t vkd3d_bench_features(void);
 void vkd3d_bench_pinned_add(const void *ptr, uint64_t size);
 void vkd3d_bench_pinned_remove(const void *ptr);

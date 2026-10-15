@@ -4821,6 +4821,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
     vkd3d_memtrace_resource_create(device, object, "placed");
     vkd3d_frametrace_watch_resource(object, false);
+    vkd3d_bench_ck_placed(heap, object);
     *resource = object;
     return S_OK;
 
