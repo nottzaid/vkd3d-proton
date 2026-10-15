@@ -25598,6 +25598,8 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         if (cmd_list->bench_idxc_use_count)
             vkd3d_index_cache_check_submit(cmd_list->bench_idxc_uses, cmd_list->bench_idxc_use_count);
     }
+    for (i = 0; i < cmd_submit_count; i++)
+        vkd3d_gputime_ecl(buffers[i].commandBuffer);
     d3d12_command_queue_add_submission(command_queue, &sub);
 }
 

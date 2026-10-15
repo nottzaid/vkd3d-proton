@@ -16,8 +16,12 @@
  * ts_ns is the segment's end on the GPU clock; dur_ns = end - previous timestamp in the same
  * command buffer (for the first segment, end - start of the command buffer). kind is the mark that
  * ends the segment: b(arrier) r(ender pass begins) e(nd of render pass) z (end of command buffer).
- * Command buffers also get a "GS frame queue seq start_ns submit_cpu_ms" line (CPU time of the
- * vkQueueSubmit2, ms since the Unix epoch like the GPU timer), presents a "GP frame cpu_ns" line.
+ * Command buffers also get a "GS frame queue seq start_ns submit_cpu_ms ecl_cpu_ms submit_end_cpu_ms waits signals
+ * index sem0:value sem1:value" line (waits, signals: of the VkSubmitInfo2 holding it; index: its place in that submit;
+ * the first two wait semaphores, the first signal semaphore)
+ * (CPU times, ms since the Unix epoch like the GPU timer: the vkQueueSubmit2 call, the game's
+ * ExecuteCommandLists that queued it (0 if not seen), the return of vkQueueSubmit2), presents a
+ * "GP frame cpu_ns" line.
  * VKD3D_BENCH_GPUTIME_RUN=n samples n consecutive frames each time (default 1).
  */
 
@@ -49,7 +53,10 @@ struct gt_cmd
     VkCommandBuffer cmd;
     VkQueryPool pool;
     uint32_t count;
-    uint64_t frame, seq, submit_ns;
+    uint64_t frame, seq, submit_ns, ecl_ns, submit_end_ns;
+    uint32_t sub_waits, sub_signals, sub_index; /* of the VkSubmitInfo2 holding it; its index in it */
+    VkSemaphore wait_sem[2], signal_sem;
+    uint64_t wait_val[2], signal_val;
     VkQueue queue;
     bool submitted;
     uint32_t rp_width, rp_height;
@@ -220,6 +227,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL gt_BeginCommandBuffer(VkCommandBuffer cmd,
     memset(&c->cur, 0, sizeof(c->cur));
     c->count = 0;
     c->note_count = 0;
+    c->ecl_ns = c->submit_end_ns = 0;
     gt_mark(c, 's');
     return vr;
 }
@@ -483,10 +491,15 @@ static uint64_t gt_epoch_ns(void)
 
 static VKAPI_ATTR VkResult VKAPI_CALL gt_QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence)
 {
-    uint64_t now = gt_epoch_ns();
+    uint64_t now = gt_epoch_ns(), end;
     struct gt_cmd *c;
-    uint32_t i, j;
+    VkResult vr;
+    uint32_t i, j, k;
 
+    /* The command buffers stay in the table until the bookkeeping below (they cannot complete and be
+     * reused before vkQueueSubmit2 returns to the one thread submitting on this queue). */
+    vr = gt_orig.vkQueueSubmit2(queue, count, submits, fence);
+    end = gt_epoch_ns();
     if (__atomic_load_n(&gt_tracked, __ATOMIC_RELAXED))
     {
         pthread_mutex_lock(&gt_lock);
@@ -500,6 +513,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL gt_QueueSubmit2(VkQueue queue, uint32_t co
                 c->queue = queue;
                 c->seq = ++gt_seq;
                 c->submit_ns = now;
+                c->submit_end_ns = end;
+                c->sub_waits = submits[i].waitSemaphoreInfoCount;
+                c->sub_signals = submits[i].signalSemaphoreInfoCount;
+                c->sub_index = j;
+                c->wait_sem[0] = c->wait_sem[1] = VK_NULL_HANDLE;
+                c->wait_val[0] = c->wait_val[1] = 0;
+                c->signal_sem = submits[i].signalSemaphoreInfoCount ? submits[i].pSignalSemaphoreInfos[0].semaphore : VK_NULL_HANDLE;
+                c->signal_val = submits[i].signalSemaphoreInfoCount ? submits[i].pSignalSemaphoreInfos[0].value : 0;
+                for (k = 0; k < submits[i].waitSemaphoreInfoCount && k < 2; k++)
+                {
+                    c->wait_sem[k] = submits[i].pWaitSemaphoreInfos[k].semaphore;
+                    c->wait_val[k] = submits[i].pWaitSemaphoreInfos[k].value;
+                }
                 c->submitted = true;
                 c->next = gt_pending;
                 gt_pending = c;
@@ -507,7 +533,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL gt_QueueSubmit2(VkQueue queue, uint32_t co
         }
         pthread_mutex_unlock(&gt_lock);
     }
-    return gt_orig.vkQueueSubmit2(queue, count, submits, fence);
+    return vr;
+}
+
+/* From ExecuteCommandLists, for each command buffer it queues: when the game handed it over. */
+void vkd3d_gputime_ecl(VkCommandBuffer cmd)
+{
+    struct gt_cmd *c;
+
+    if ((c = gt_lookup(cmd)))
+        c->ecl_ns = gt_epoch_ns();
 }
 
 void vkd3d_gputime_install(struct d3d12_device *device)
@@ -613,8 +648,11 @@ void vkd3d_gputime_present(void)
         *p = c->next;
         if (vr == VK_SUCCESS && c->count)
         {
-            fprintf(gt_file, "GS\t%"PRIu64"\t%p\t%"PRIu64"\t%"PRIu64"\t%.3f\n", c->frame, (void *)c->queue, c->seq,
-                    (uint64_t)(ts[0] * gt_period), c->submit_ns / 1e6);
+            fprintf(gt_file, "GS\t%"PRIu64"\t%p\t%"PRIu64"\t%"PRIu64"\t%.3f\t%.3f\t%.3f\t%u\t%u\t%u\t%"PRIx64":%"PRIu64"\t%"PRIx64":%"PRIu64"\t%"PRIx64":%"PRIu64"\n",
+                    c->frame, (void *)c->queue, c->seq, (uint64_t)(ts[0] * gt_period), c->submit_ns / 1e6, c->ecl_ns / 1e6,
+                    c->submit_end_ns / 1e6, c->sub_waits, c->sub_signals, c->sub_index,
+                    (uint64_t)c->wait_sem[0], c->wait_val[0], (uint64_t)c->wait_sem[1], c->wait_val[1],
+                    (uint64_t)c->signal_sem, c->signal_val);
             prev = ts[0];
             for (i = 1; i < c->count; i++)
             {

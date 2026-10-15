@@ -7458,6 +7458,7 @@ void vkd3d_frametrace_viewport(float width, float height);
 void vkd3d_gputime_install(struct d3d12_device *device);
 void vkd3d_gputime_present(void);
 void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
+void vkd3d_gputime_ecl(VkCommandBuffer cmd);
 bool vkd3d_gputime_tracking(VkCommandBuffer cmd);
 void vkd3d_gputime_note_stack(VkCommandBuffer cmd, const char *what);
 void vkd3d_gputime_dispatch_label(VkCommandBuffer cmd, uint64_t shader_hash, uint32_t x, uint32_t y, uint32_t z);

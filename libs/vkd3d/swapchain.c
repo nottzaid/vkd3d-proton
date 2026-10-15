@@ -2969,8 +2969,21 @@ static bool dxgi_vk_swap_chain_setup_present_timing_request(
     return use_present_timing_target;
 }
 
+/* miles-bench diagnostic (VKD3D_BENCH_PRESENT_TIMING=1): where the present task's time goes on the queue thread,
+ * one frame-trace line per present: "present acquire_us blit_us present_us mode". */
+static bool vkd3d_bench_present_timing(void)
+{
+    static int enabled = -1;
+    char env[8];
+
+    if (enabled < 0)
+        enabled = vkd3d_get_env_var("VKD3D_BENCH_PRESENT_TIMING", env, sizeof(env)) && env[0] == '1';
+    return enabled;
+}
+
 static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chain, uint64_t present_count, unsigned int retry_counter)
 {
+    uint64_t bench_t0 = 0, bench_t1 = 0, bench_t2 = 0;
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
     VkSwapchainPresentFenceInfoKHR present_fence_info;
     VkSwapchainPresentModeInfoKHR present_mode_info;
@@ -2992,7 +3005,11 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     if (!chain->present.vk_swapchain)
         return;
 
+    if (vkd3d_bench_present_timing())
+        bench_t0 = vkd3d_get_current_time_ns();
     vr = dxgi_vk_swap_chain_try_acquire_next_image(chain);
+    if (bench_t0)
+        bench_t1 = vkd3d_get_current_time_ns();
     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
 
     /* Handle any errors and retry as needed. If we cannot make meaningful forward progress, just give up and retry later. */
@@ -3020,6 +3037,8 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
 
     if (!dxgi_vk_swap_chain_submit_blit(chain, swapchain_index))
         return;
+    if (bench_t0)
+        bench_t2 = vkd3d_get_current_time_ns();
 
     memset(&present_info, 0, sizeof(present_info));
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -3117,6 +3136,12 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
     VKD3D_REGION_END(queue_present);
     vkd3d_queue_release(chain->queue->vkd3d_queue);
+    if (bench_t0)
+    {
+        uint64_t bench_t3 = vkd3d_get_current_time_ns();
+        vkd3d_frametrace_event("present %.1f %.1f %.1f mode %d", (bench_t1 - bench_t0) / 1e3, (bench_t2 - bench_t1) / 1e3,
+                (bench_t3 - bench_t2) / 1e3, (int)chain->present.selected_present_mode);
+    }
 
     if (chain->queue->device->vk_info.NV_low_latency2 && chain->request.low_latency_frame_id)
     {
