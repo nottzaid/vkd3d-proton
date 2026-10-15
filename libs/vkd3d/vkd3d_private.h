@@ -1004,7 +1004,20 @@ bool vkd3d_geomirror_active(void);
 void vkd3d_bench_input_start(uint8_t *image);
 
 /* lightgrid.c (miles-bench, VKD3D_BENCH_LIGHTGRID_SPARSE=1) */
-bool vkd3d_lightgrid_heap_wanted(const D3D12_HEAP_DESC *desc);
+/* learned.c (miles-bench): sizes measured in earlier sessions of the same exe build */
+enum vkd3d_bench_learned
+{
+    VKD3D_BENCH_LEARNED_LIGHTGRID_PAGES, /* light grid pages in use at the peak (highest page + 1) */
+    VKD3D_BENCH_LEARNED_SKIN_BYTES,      /* skinning bytes in use at the peak, larger half */
+    VKD3D_BENCH_LEARNED_RESERVE_BYTES,   /* the VRAM reserve a session needed (memtrace.c) */
+    VKD3D_BENCH_LEARNED_HOLD_BYTES,      /* VRAM hidden from the game's budget (lightgrid.c) */
+    VKD3D_BENCH_LEARNED_COUNT,
+};
+bool vkd3d_bench_learned_get(enum vkd3d_bench_learned key, uint64_t *value);
+void vkd3d_bench_learned_raise(enum vkd3d_bench_learned key, uint64_t value);
+
+bool vkd3d_bench_sparse_buffers(struct d3d12_device *device);
+bool vkd3d_lightgrid_heap_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc);
 HRESULT vkd3d_lightgrid_create_placed(struct d3d12_device *device, struct d3d12_heap *heap,
         uint64_t heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
         struct d3d12_resource **resource);
@@ -1012,10 +1025,11 @@ void vkd3d_lightgrid_update(void);
 void vkd3d_lightgrid_resource_destroyed(struct d3d12_resource *resource);
 uint64_t vkd3d_lightgrid_budget_reserve(void);
 void vkd3d_lightgrid_hook_budget(IUnknown *adapter);
+void vkd3d_bench_hold_raise(uint64_t bytes);
 
 /* skinbuf.c (miles-bench, VKD3D_BENCH_SKIN_SPARSE=1) */
 bool vkd3d_skinbuf_wanted(void);
-bool vkd3d_skinbuf_heap_wanted(const D3D12_HEAP_DESC *desc);
+bool vkd3d_skinbuf_heap_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc);
 HRESULT vkd3d_skinbuf_create_placed(struct d3d12_device *device, struct d3d12_heap *heap,
         uint64_t heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
         struct d3d12_resource **resource);
@@ -1029,7 +1043,7 @@ void vkd3d_skinbuf_alloc_stub(void);
 void vkd3d_skinbuf_alloc_aligned_stub(void);
 
 /* idxcache.c (miles-bench, VKD3D_BENCH_INDEX_CACHE=1) */
-bool vkd3d_index_cache_wanted(const D3D12_HEAP_DESC *desc);
+bool vkd3d_index_cache_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc);
 void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *heap);
 void vkd3d_index_cache_unregister(struct d3d12_heap *heap);
 bool vkd3d_index_cache_is_source(VkBuffer buffer);
@@ -6140,8 +6154,19 @@ static inline uint32_t vkd3d_bindless_state_find_set_info_index_fast(struct d3d1
 }
 
 bool vkd3d_bench_l0_sysmem(struct d3d12_device *device, const D3D12_HEAP_PROPERTIES *heap_properties);
+enum vkd3d_bench_vram_class
+{
+    VKD3D_BENCH_VRAM_OTHER,
+    VKD3D_BENCH_VRAM_COLD, /* held back by the VRAM reserve */
+    VKD3D_BENCH_VRAM_HOT,  /* what the reserve is for */
+};
 VkDeviceSize vkd3d_bench_vram_reserve(const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
-        uint32_t allocation_flags);
+        uint32_t allocation_flags, enum vkd3d_bench_vram_class *vram_class);
+void vkd3d_bench_vram_short(void);
+bool vkd3d_bench_vram_learning(void);
+void vkd3d_bench_vram_headroom(int64_t free, VkDeviceSize size, bool failed);
+void vkd3d_bench_vram_hot(VkDeviceMemory memory, VkDeviceSize size);
+void vkd3d_bench_vram_freed(VkDeviceMemory memory);
 void vkd3d_bench_vram_refused(uint64_t size);
 bool vkd3d_bench_vram_reserve_chunks(void);
 uint32_t vkd3d_bench_sysmem_alloc(struct d3d12_device *device, uint32_t type_bits, VkDeviceSize size,
@@ -7362,6 +7387,8 @@ void vkd3d_memtrace_vk_free(uint32_t vk_type, uint64_t size, VkDeviceMemory vk_m
 /* enginepatch.c (miles-bench, enabled by VKD3D_ENGINE_PATCH=spin and VKD3D_FRAMETRACE=<file>) */
 extern bool vkd3d_engine_spin_patched;
 void vkd3d_engine_patch_apply(void);
+bool vkd3d_engine_geometry_hooked(void);
+bool vkd3d_engine_skin_hooked(void);
 void vkd3d_engine_note_fence_poll(struct d3d12_fence *fence, uint64_t value);
 void vkd3d_frametrace_present(void);
 void vkd3d_engine_present(void);

@@ -336,13 +336,13 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
 
     /* lightgrid.c: the light grid's 512 MiB heap keeps one 64 KiB page of its own (so the heap is
      * an ordinary one to everything else); its buffer is sparse and backed page by page. */
-    if (!host_address && vkd3d_lightgrid_heap_wanted(&heap->desc))
+    if (!host_address && vkd3d_lightgrid_heap_wanted(device, &heap->desc))
     {
         heap->lightgrid = true;
         alloc_info.heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     }
     /* skinbuf.c: same for the skinning buffer's 196 MiB heap, backed as the engine allocates. */
-    else if (!host_address && vkd3d_skinbuf_heap_wanted(&heap->desc))
+    else if (!host_address && vkd3d_skinbuf_heap_wanted(device, &heap->desc))
     {
         heap->skinbuf = true;
         alloc_info.heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -427,7 +427,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         }
     }
 
-    if (!geomirror && !host_address && vkd3d_index_cache_wanted(&heap->desc))
+    if (!geomirror && !host_address && vkd3d_index_cache_wanted(device, &heap->desc))
         vkd3d_index_cache_register(device, heap);
 
     heap->priority.allows_dynamic_residency = 

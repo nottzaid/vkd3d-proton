@@ -11,9 +11,11 @@
  * entries the CPU writes after allocating them.
  *
  * Here that heap gets no memory of its own and the buffer is created as a sparse (reserved) buffer.
- * The null page and pages 0..bound-1 are backed by VRAM: bound starts at
- * VKD3D_BENCH_LIGHTGRID_INITIAL pages (default 5120) and grows in 4 MiB steps to stay
- * VKD3D_BENCH_LIGHTGRID_MARGIN pages (default 512) ahead of the highest allocated page. Every
+ * The null page and pages 0..bound-1 are backed by VRAM: bound starts one margin
+ * (VKD3D_BENCH_LIGHTGRID_MARGIN pages, default 512) past the most pages earlier sessions of this
+ * build had in use (learned.c), or at every page, as the original heap, before anything was learned
+ * (VKD3D_BENCH_LIGHTGRID_INITIAL overrides it), and grows in 4 MiB steps to stay a margin ahead of
+ * the highest allocated page. Every
  * ExecuteCommandLists first checks the bitmap and, if more pages are needed, backs them and waits
  * for the bind on the CPU before anything is submitted, on any queue. A list can only use a page
  * after the CPU allocated it, so every page a list can address is backed when the list reaches the
@@ -25,7 +27,8 @@
  * cannot fit in system memory, same textures, sampled from there). In the open world the game goes
  * over that budget anyway (usage ~2480 MiB against ~2250, play-1013/1014) and growth then finds
  * no VRAM; the pages it could not back were read as zeros, lights missing (a visibly dark area in
- * the chase, user report 2026-10-14). Hence the larger initial backing. Growth would fall back to
+ * the chase, user report 2026-10-14). Hence an initial backing that covers the most pages the game
+ * has been seen to use, measured on this build rather than guessed. Growth would fall back to
  * system memory if the buffer allowed it, but on this GPU sparse buffers only take the VRAM type
  * (memory types 0x80). A failed growth is retried every 20 ms; a page in use that is not backed is
  * a loss and is counted and logged as one.
@@ -61,11 +64,12 @@ struct lightgrid_bitmap
 };
 
 static int lightgrid_enabled = -1;
-/* Initial backing: in the open world the engine reaches page ~4340 (the Rhino chase, fr1) while the
- * game itself runs over its VRAM budget, so growth can find no VRAM there and the sparse buffer
- * only takes VRAM-only memory types (0x80 on this GPU, no system memory fallback). 5120 pages
- * (320 MiB of 512) are backed at creation, when VRAM is still free; growth covers the rest. */
-static uint32_t lightgrid_margin = 512, lightgrid_initial = 5120;
+/* Initial backing: in the open world the engine reached page 4341 (the Rhino chase) while the game
+ * itself ran over its VRAM budget, so growth found no VRAM there, and on NVIDIA the sparse buffer
+ * only takes VRAM-only memory types (no system memory fallback). So the backing made at creation,
+ * while VRAM is still free, covers the most pages earlier sessions used (learned.c); with nothing
+ * learned yet it is the whole buffer. lightgrid_initial: VKD3D_BENCH_LIGHTGRID_INITIAL, 0 = unset. */
+static uint32_t lightgrid_margin = 512, lightgrid_initial;
 static pthread_mutex_t lightgrid_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct
@@ -123,7 +127,16 @@ static const struct lightgrid_bitmap *lightgrid_engine_bitmap(void)
 
 /* The light grid heap: DEFAULT, buffers only, exactly (bitmap pages + 1) x 64 KiB, created right
  * after the engine set up the bitmap for that many pages. */
-bool vkd3d_lightgrid_heap_wanted(const D3D12_HEAP_DESC *desc)
+/* Sparse buffers need sparse binding, buffer residency and vkd3d's internal sparse queue (which does
+ * the binds); without them the light grid and skinning heaps keep their memory. */
+bool vkd3d_bench_sparse_buffers(struct d3d12_device *device)
+{
+    const VkPhysicalDeviceFeatures *features = &device->device_info.features2.features;
+
+    return device->internal_sparse_queue && features->sparseBinding && features->sparseResidencyBuffer;
+}
+
+bool vkd3d_lightgrid_heap_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc)
 {
     const struct lightgrid_bitmap *bitmap;
 
@@ -136,6 +149,11 @@ bool vkd3d_lightgrid_heap_wanted(const D3D12_HEAP_DESC *desc)
     if (!(bitmap = lightgrid_engine_bitmap()) || !bitmap->level2 || bitmap->count < 64 ||
             desc->SizeInBytes != (uint64_t)(bitmap->count + 1) * LIGHTGRID_PAGE)
         return false;
+    if (!vkd3d_bench_sparse_buffers(device))
+    {
+        INFO("light grid: no sparse buffers; the heap keeps its memory.\n");
+        return false;
+    }
     INFO("light grid: heap of %u pages matches the engine's page bitmap; it gets no memory, "
             "its buffer is backed page by page.\n", bitmap->count + 1);
     return true;
@@ -271,7 +289,9 @@ HRESULT vkd3d_lightgrid_create_placed(struct d3d12_device *device, struct d3d12_
     VkMemoryRequirements requirements;
     struct d3d12_resource *object;
     VkFenceCreateInfo fence_info;
-    uint32_t pages, type_bits;
+    uint32_t pages, type_bits, initial;
+    const char *source = "setup failed";
+    uint64_t learned;
     HRESULT hr;
 
     pages = heap->desc.SizeInBytes / LIGHTGRID_PAGE;
@@ -326,14 +346,29 @@ HRESULT vkd3d_lightgrid_create_placed(struct d3d12_device *device, struct d3d12_
     }
     else
     {
+        if (lightgrid_initial)
+        {
+            initial = min(lightgrid_initial, pages - 1);
+            source = "VKD3D_BENCH_LIGHTGRID_INITIAL";
+        }
+        else if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_LIGHTGRID_PAGES, &learned) && learned)
+        {
+            initial = lightgrid_target((int32_t)min(learned, (uint64_t)pages - 1) - 1);
+            source = "learned peak + margin";
+        }
+        else
+        {
+            initial = pages - 1;
+            source = "nothing learned yet: every page";
+        }
         lightgrid.highest_seen = max(lightgrid_highest(), 0);
-        lightgrid_grow(max(min(lightgrid_initial, pages - 1), lightgrid_target(lightgrid_highest())));
+        lightgrid_grow(max(initial, lightgrid_target(lightgrid_highest())));
     }
     pthread_mutex_unlock(&lightgrid_lock);
 
     INFO("light grid: \"Light Grid Data Buffer\" is sparse: %u pages, VA %#"PRIx64", memory type %u (types %#x), "
-            "initial %u, margin %u pages.\n", pages, object->res.va, lightgrid.memory_type,
-            lightgrid.type_bits, lightgrid_initial, lightgrid_margin);
+            "initial %u (%s), margin %u pages.\n", pages, object->res.va, lightgrid.memory_type,
+            lightgrid.type_bits, lightgrid.bound, source, lightgrid_margin);
     *resource = object;
     return S_OK;
 }
@@ -347,6 +382,15 @@ void vkd3d_lightgrid_update(void)
     if (!lightgrid.resource || lightgrid.broken)
         return;
     highest = lightgrid_highest();
+    /* The peak is what later sessions back at creation; it is kept even when the backing is far ahead. */
+    if (highest > (int32_t)vkd3d_atomic_uint32_load_explicit(&lightgrid.highest_seen, vkd3d_memory_order_relaxed))
+    {
+        pthread_mutex_lock(&lightgrid_lock);
+        if (lightgrid.resource)
+            lightgrid.highest_seen = max(lightgrid.highest_seen, (uint32_t)highest);
+        pthread_mutex_unlock(&lightgrid_lock);
+        vkd3d_bench_learned_raise(VKD3D_BENCH_LEARNED_LIGHTGRID_PAGES, (uint64_t)highest + 1);
+    }
     bound = vkd3d_atomic_uint32_load_explicit(&lightgrid.bound, vkd3d_memory_order_acquire);
     if ((uint32_t)(highest + 1) + lightgrid_margin / 2 <= bound)
         return;
@@ -373,16 +417,22 @@ void vkd3d_lightgrid_update(void)
     pthread_mutex_unlock(&lightgrid_lock);
 }
 
-/* VRAM the game should leave free: room for two margins of growth, plus any pages still wanted. */
+/* VRAM the game should leave free for growth: what backing three margins past the highest page
+ * ever allocated (at most the whole buffer) or the pages still wanted would add. The hold ramps up
+ * from nothing as the pages in use come within three margins of the backed range and reaches two
+ * margins when growth is due (it starts one margin ahead), so the streamer makes room in time; while
+ * the backing is well ahead the game's budget is left as it is. */
 uint64_t vkd3d_lightgrid_budget_reserve(void)
 {
-    uint32_t wanted, bound;
+    uint32_t wanted, bound, highest, target;
 
     if (!lightgrid.resource || lightgrid.broken)
         return 0;
     wanted = vkd3d_atomic_uint32_load_explicit(&lightgrid.wanted, vkd3d_memory_order_relaxed);
     bound = vkd3d_atomic_uint32_load_explicit(&lightgrid.bound, vkd3d_memory_order_relaxed);
-    return ((uint64_t)2 * lightgrid_margin + (wanted > bound ? wanted - bound : 0)) * LIGHTGRID_PAGE;
+    highest = vkd3d_atomic_uint32_load_explicit(&lightgrid.highest_seen, vkd3d_memory_order_relaxed);
+    target = max(min(highest + 3 * lightgrid_margin, lightgrid.pages - 1), wanted);
+    return target > bound ? (uint64_t)(target - bound) * LIGHTGRID_PAGE : 0;
 }
 
 /* Called from d3d12_resource_destroy once the buffer's Vulkan objects are gone, which is when
@@ -426,20 +476,74 @@ typedef HRESULT (STDMETHODCALLTYPE *lightgrid_query_video_memory_info)(IUnknown 
 static lightgrid_query_video_memory_info lightgrid_query_original;
 static uint64_t lightgrid_budget_queries;
 
+/* The game's texture streamer fills the budget it is told and then some (it ran 70-95 MiB over it
+ * in the fight), so on a card with no VRAM to spare it also takes the VRAM that vkd3d's own later
+ * allocations (render targets, buffers, chunks) need; those then fail and land in system memory
+ * (play-1015: 119-269 failed VRAM allocations, -6.4% fps, with only the growth margins held back).
+ * So the budget the game is told also leaves out a learned hold: what earlier sessions of this build
+ * found it takes (learned.c), raised at once when one of vkd3d's allocations of VRAM fails
+ * (vkd3d_bench_hold_raise, from memtrace.c), so the streamer makes room in the same session. A raise
+ * is the failed allocation's size (holding X back frees less than X: the streamer gives up only part
+ * of it), and failures within the streamer's reaction time (2 s) after a raise add only what a larger
+ * one needs beyond it, so a burst of failures counts once. It never shrinks within a session (the
+ * streamer would reload what it just dropped). */
+#define BENCH_HOLD_REACTION_NS 2000000000ull
+static uint64_t bench_hold, bench_hold_window_start, bench_hold_window_max;
+static pthread_mutex_t bench_hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t bench_hold_once = PTHREAD_ONCE_INIT;
+
+static void bench_hold_init(void)
+{
+    uint64_t learned;
+    char env[16];
+
+    if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_HOLD_BYTES, &learned))
+        bench_hold = learned;
+    /* VKD3D_BENCH_BUDGET_HOLD_MB=N: at least N MiB (experiments). */
+    if (vkd3d_get_env_var("VKD3D_BENCH_BUDGET_HOLD_MB", env, sizeof(env)) && *env)
+        bench_hold = max(bench_hold, (uint64_t)atoi(env) << 20);
+    INFO("light grid: %"PRIu64" MiB of VRAM held back from the game's budget besides growth room.\n", bench_hold >> 20);
+}
+
+/* A VRAM allocation of `size` bytes failed. */
+void vkd3d_bench_hold_raise(uint64_t size)
+{
+    uint64_t now = vkd3d_get_current_time_ns(), raise, hold;
+
+    pthread_once(&bench_hold_once, bench_hold_init);
+    pthread_mutex_lock(&bench_hold_lock);
+    if (now - bench_hold_window_start >= BENCH_HOLD_REACTION_NS)
+    {
+        bench_hold_window_start = now;
+        bench_hold_window_max = 0;
+    }
+    raise = size > bench_hold_window_max ? size - bench_hold_window_max : 0;
+    bench_hold_window_max = max(bench_hold_window_max, size);
+    hold = __atomic_add_fetch(&bench_hold, raise, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&bench_hold_lock);
+    if (!raise)
+        return;
+    vkd3d_bench_learned_raise(VKD3D_BENCH_LEARNED_HOLD_BYTES, hold);
+    INFO("light grid: a %.1f MiB VRAM allocation failed; holding %.1f MiB back from the game now.\n",
+            size / 1048576.0, hold / 1048576.0);
+}
+
 static HRESULT STDMETHODCALLTYPE lightgrid_query_video_memory_info_hook(IUnknown *iface, UINT node,
         UINT segment_group, struct lightgrid_video_memory_info *info)
 {
     uint64_t reserve;
     HRESULT hr;
 
+    pthread_once(&bench_hold_once, bench_hold_init);
     hr = lightgrid_query_original(iface, node, segment_group, info);
     if (SUCCEEDED(hr) && info && segment_group == 0 /* DXGI_MEMORY_SEGMENT_GROUP_LOCAL */ &&
-            (reserve = vkd3d_lightgrid_budget_reserve() + vkd3d_skinbuf_budget_reserve()))
+            (reserve = max(vkd3d_lightgrid_budget_reserve() + vkd3d_skinbuf_budget_reserve(),
+            __atomic_load_n(&bench_hold, __ATOMIC_RELAXED))))
     {
         info->budget = info->budget > reserve ? info->budget - reserve : 0;
         if (!(lightgrid_budget_queries++ % 3600))
-            INFO("light grid: VRAM budget reported %"PRIu64" MiB (%"PRIu64" MiB held for light grid and skinning growth), "
-                    "usage %"PRIu64" MiB.\n", info->budget >> 20, reserve >> 20, info->current_usage >> 20);
+            INFO("light grid: VRAM budget reported %"PRIu64" MiB (%"PRIu64" MiB held back), usage %"PRIu64" MiB.\n",
+                    info->budget >> 20, reserve >> 20, info->current_usage >> 20);
     }
     return hr;
 }

@@ -356,52 +356,184 @@ bool vkd3d_bench_l0_sysmem(struct d3d12_device *device, const D3D12_HEAP_PROPERT
 }
 
 static pthread_once_t vram_reserve_once = PTHREAD_ONCE_INIT;
+static bool vram_reserve_enabled;
 static VkDeviceSize vram_reserve_bytes;
 static bool vram_reserve_texture_heaps;
 static uint64_t vram_refused_count, vram_refused_bytes;
 
+/* The reserve's size: VKD3D_BENCH_VRAM_RESERVE_MB=N sets it; with VKD3D_BENCH_VRAM_RESERVE=1 it is
+ * what earlier sessions of this build measured (vkd3d_bench_vram_hot below), and before anything was
+ * learned there is none, as without the patch, while this session measures it. */
 static void vram_reserve_init(void)
 {
+    const char *source = NULL;
+    uint64_t learned;
     char value[64];
 
-    if (vkd3d_get_env_var("VKD3D_BENCH_VRAM_RESERVE_MB", value, sizeof(value)))
+    if (vkd3d_get_env_var("VKD3D_BENCH_VRAM_RESERVE_MB", value, sizeof(value)) && *value)
+    {
         vram_reserve_bytes = strtoull(value, NULL, 10) << 20;
+        source = "VKD3D_BENCH_VRAM_RESERVE_MB";
+    }
+    else if (vkd3d_get_env_var("VKD3D_BENCH_VRAM_RESERVE", value, sizeof(value)) && value[0] == '1')
+    {
+        if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_RESERVE_BYTES, &learned))
+        {
+            vram_reserve_bytes = learned;
+            source = "learned";
+        }
+        else
+            source = "nothing learned yet; measuring";
+    }
+    vram_reserve_enabled = !!source;
     /* Game texture heaps (DEFAULT, texture-only, no RT/DS) mostly hold streamed textures but also a few
      * small UAV textures, so they are only treated as cold on request. */
     vram_reserve_texture_heaps = vkd3d_get_env_var("VKD3D_BENCH_VRAM_RESERVE_TEXHEAPS", value, sizeof(value)) &&
             value[0] == '1';
-    if (vram_reserve_bytes)
+    if (vram_reserve_enabled)
     {
-        INFO("bench: keeping the last %"PRIu64" MiB of VRAM for render targets, depth and UAVs%s.\n",
-                vram_reserve_bytes >> 20, vram_reserve_texture_heaps ? " (texture heaps are cold too)" : "");
+        INFO("bench: keeping the last %"PRIu64" MiB of VRAM for render targets, depth and UAVs (%s)%s.\n",
+                vram_reserve_bytes >> 20, source, vram_reserve_texture_heaps ? " (texture heaps are cold too)" : "");
     }
 }
 
-/* With VKD3D_BENCH_VRAM_RESERVE_MB=N, allocations that are only ever sampled stop taking VRAM once less than
- * N MiB of the budget is left, and fall back to system memory instead. Placement in vkd3d-proton is fixed at
- * allocation time (no WDDM-style paging), so without this, render targets created after VRAM fills up
- * (shadow cascades and full-res depth at level load, in Miles Morales) live in system memory for the rest
- * of the session and the GPU writes and reads them over PCIe every frame. Returns the reserve that applies
- * to this allocation, 0 if it may use all of VRAM. */
+/* With the reserve on, allocations that are only ever sampled stop taking VRAM once less than the
+ * reserve is left of the budget, and fall back to system memory instead. Placement in vkd3d-proton is
+ * fixed at allocation time (no WDDM-style paging), so without this, render targets created after VRAM
+ * fills up (shadow cascades and full-res depth at level load, in Miles Morales) live in system memory
+ * for the rest of the session and the GPU writes and reads them over PCIe every frame. Returns the
+ * reserve that applies to this allocation, 0 if it may use all of VRAM. *vram_class: COLD for what the
+ * reserve holds back, HOT for what it is for (render targets, depth, UAV textures, buffers), OTHER for
+ * neither (the game's texture heaps, mostly streamed textures but with a few UAV textures, which are
+ * cold only with VKD3D_BENCH_VRAM_RESERVE_TEXHEAPS=1). */
 VkDeviceSize vkd3d_bench_vram_reserve(const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
-        uint32_t allocation_flags)
+        uint32_t allocation_flags, enum vkd3d_bench_vram_class *vram_class)
 {
     pthread_once(&vram_reserve_once, vram_reserve_init);
-    if (!vram_reserve_bytes || (allocation_flags & VKD3D_ALLOCATION_FLAG_BENCH_HOT))
+    *vram_class = VKD3D_BENCH_VRAM_OTHER;
+    if (!vram_reserve_enabled)
         return 0;
 
-    /* Buffers (geometry, UAV buffers) and anything that can hold render targets or depth stay hot. */
-    if (!(heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS) || !(heap_flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES))
+    /* Buffers (UAV and constant buffers) and anything that can hold render targets, depth or UAVs stay hot. */
+    if ((allocation_flags & VKD3D_ALLOCATION_FLAG_BENCH_HOT) || !(heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS) ||
+            !(heap_flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES))
+    {
+        *vram_class = VKD3D_BENCH_VRAM_HOT;
         return 0;
+    }
 
     /* The engine's demotion pool: CUSTOM, L0, no CPU access. */
     if (heap_properties->Type == D3D12_HEAP_TYPE_CUSTOM)
-        return heap_properties->MemoryPoolPreference == D3D12_MEMORY_POOL_L0 ? vram_reserve_bytes : 0;
+    {
+        if (heap_properties->MemoryPoolPreference == D3D12_MEMORY_POOL_L0)
+            *vram_class = VKD3D_BENCH_VRAM_COLD;
+    }
+    else if ((allocation_flags & VKD3D_ALLOCATION_FLAG_BENCH_COMMITTED) || vram_reserve_texture_heaps)
+        *vram_class = VKD3D_BENCH_VRAM_COLD;
+    return *vram_class == VKD3D_BENCH_VRAM_COLD ? vram_reserve_bytes : 0;
+}
 
-    if (allocation_flags & VKD3D_ALLOCATION_FLAG_BENCH_COMMITTED)
-        return vram_reserve_bytes;
+/* Learning the reserve. VRAM first runs short when a cold allocation is refused or an allocation of
+ * VRAM fails. From then on, everything that is not cold (render targets, depth, UAVs, buffers, the
+ * game's texture heaps, vkd3d's own chunks) eats into the reserve, so the reserve this session
+ * needed is its size minus the least VRAM left free after any allocation of VRAM, where an allocation
+ * that failed (it fell back to system memory) counts as that much less than nothing
+ * (vkd3d_bench_vram_headroom). The most any session of this build needed is learned (learned.c) and
+ * kept back by later sessions. With VRAM to spare nothing runs short and nothing is learned.
+ * vkd3d_bench_vram_hot keeps the hot share of it for the log. */
+static bool vram_short;
+static int64_t vram_min_free = INT64_MAX, vram_largest_late;
+static pthread_mutex_t vram_late_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct vram_late { VkDeviceMemory memory; VkDeviceSize size; } *vram_late;
+static size_t vram_late_count, vram_late_size;
+static uint64_t vram_late_bytes, vram_late_peak, vram_late_logged;
 
-    return vram_reserve_texture_heaps ? vram_reserve_bytes : 0;
+void vkd3d_bench_vram_short(void)
+{
+    pthread_once(&vram_reserve_once, vram_reserve_init);
+    if (vram_reserve_enabled && !__atomic_exchange_n(&vram_short, true, __ATOMIC_ACQ_REL))
+        INFO("bench: VRAM ran short; hot allocations from here on are what the reserve has to make room for.\n");
+}
+
+bool vkd3d_bench_vram_learning(void)
+{
+    return vram_reserve_enabled && __atomic_load_n(&vram_short, __ATOMIC_ACQUIRE);
+}
+
+/* After an allocation of VRAM that is not cold, while learning: `free` is the VRAM it left (budget
+ * minus usage). One that failed was short by at least its size, whatever the budget said (the driver
+ * refused 6 MiB allocations with ~20 MiB of budget left, v15-S13-1). */
+void vkd3d_bench_vram_headroom(int64_t free, VkDeviceSize size, bool failed)
+{
+    int64_t needed;
+
+    if (!vkd3d_bench_vram_learning())
+        return;
+    pthread_mutex_lock(&vram_late_lock);
+    vram_largest_late = max(vram_largest_late, (int64_t)size);
+    /* A failed allocation: the game's streamer took too much; it makes room from its next budget query. */
+    if (failed)
+    {
+        free = min(free, 0) - (int64_t)size;
+        vkd3d_bench_hold_raise(size);
+    }
+    if (free < vram_min_free)
+    {
+        vram_min_free = free;
+        needed = (int64_t)vram_reserve_bytes - free;
+        if (needed > 0)
+            vkd3d_bench_learned_raise(VKD3D_BENCH_LEARNED_RESERVE_BYTES, (uint64_t)needed);
+        INFO("bench: %.1f MiB of VRAM left after a %.1f MiB allocation: this session needed a %.1f MiB reserve "
+                "(largest late allocation %.1f MiB).\n", free / 1048576.0, size / 1048576.0,
+                max(needed, 0) / 1048576.0, vram_largest_late / 1048576.0);
+    }
+    pthread_mutex_unlock(&vram_late_lock);
+}
+
+void vkd3d_bench_vram_hot(VkDeviceMemory memory, VkDeviceSize size)
+{
+    pthread_once(&vram_reserve_once, vram_reserve_init);
+    if (!vram_reserve_enabled || !__atomic_load_n(&vram_short, __ATOMIC_ACQUIRE) || memory == VK_NULL_HANDLE)
+        return;
+    pthread_mutex_lock(&vram_late_lock);
+    if (vkd3d_array_reserve((void **)&vram_late, &vram_late_size, vram_late_count + 1, sizeof(*vram_late)))
+    {
+        vram_late[vram_late_count].memory = memory;
+        vram_late[vram_late_count].size = size;
+        __atomic_store_n(&vram_late_count, vram_late_count + 1, __ATOMIC_RELEASE);
+        vram_late_bytes += size;
+        if (vram_late_bytes > vram_late_peak)
+        {
+            vram_late_peak = vram_late_bytes;
+            if (vram_late_peak >= vram_late_logged + (16u << 20))
+            {
+                vram_late_logged = vram_late_peak;
+                INFO("bench: %"PRIu64" MiB of hot memory asked for since VRAM ran short (reserve %"PRIu64" MiB).\n",
+                        vram_late_peak >> 20, vram_reserve_bytes >> 20);
+            }
+        }
+    }
+    pthread_mutex_unlock(&vram_late_lock);
+}
+
+void vkd3d_bench_vram_freed(VkDeviceMemory memory)
+{
+    size_t i;
+
+    if (!__atomic_load_n(&vram_late_count, __ATOMIC_ACQUIRE))
+        return;
+    pthread_mutex_lock(&vram_late_lock);
+    for (i = 0; i < vram_late_count; i++)
+    {
+        if (vram_late[i].memory == memory)
+        {
+            vram_late_bytes -= vram_late[i].size;
+            vram_late[i] = vram_late[vram_late_count - 1];
+            __atomic_store_n(&vram_late_count, vram_late_count - 1, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&vram_late_lock);
 }
 
 /* Allocate size bytes of system memory (a type out of type_bits without DEVICE_LOCAL) for the lazy

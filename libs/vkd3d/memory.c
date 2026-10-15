@@ -935,6 +935,7 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
     }
 
     vkd3d_memtrace_vk_free(allocation->vk_memory_type, allocation->size, allocation->vk_memory);
+    vkd3d_bench_vram_freed(allocation->vk_memory);
     VK_CALL(vkFreeMemory(device->vk_device, allocation->vk_memory, NULL));
     rebar_budget = !!(device->memory_info.rebar_budget_mask & (1u << allocation->vk_memory_type));
 
@@ -1238,15 +1239,61 @@ static bool vkd3d_memory_info_type_mask_covers_multiple_memory_heaps(
     return !!(heap_mask & (heap_mask - 1u));
 }
 
+/* miles-bench: pure VRAM requests tell the reserve's learning (memtrace.c) when VRAM ran short and
+ * how much hot memory was asked for after that. */
+static bool vkd3d_bench_wants_vram(VkMemoryPropertyFlags type_flags)
+{
+    return (type_flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+}
+
+/* After a pure VRAM request that is not cold, while the reserve is learning: report the VRAM left
+ * (budget minus usage of the device-local heap) and whether it failed. */
+static void vkd3d_bench_note_vram(struct d3d12_device *device, uint32_t type_mask, VkDeviceSize size, bool failed)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_info;
+    VkPhysicalDeviceMemoryProperties2 props2;
+    VkMemoryPropertyFlags flags;
+    uint32_t i;
+
+    if (!vkd3d_bench_vram_learning() || !device->vk_info.EXT_memory_budget)
+        return;
+    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
+    {
+        flags = device->memory_properties.memoryTypes[i].propertyFlags;
+        if ((type_mask & (1u << i)) && (flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            break;
+    }
+    if (i == device->memory_properties.memoryTypeCount)
+        return;
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    props2.pNext = &budget_info;
+    budget_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    budget_info.pNext = NULL;
+    VK_CALL(vkGetPhysicalDeviceMemoryProperties2(device->vk_physical_device, &props2));
+    i = device->memory_properties.memoryTypes[i].heapIndex;
+    vkd3d_bench_vram_headroom((int64_t)budget_info.heapBudget[i] - (int64_t)budget_info.heapUsage[i], size, failed);
+}
+
 static HRESULT vkd3d_allocate_device_memory_reserve(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
-        void *pNext, bool respect_budget, VkDeviceSize vram_reserve, struct vkd3d_device_memory_allocation *allocation)
+        void *pNext, bool respect_budget, VkDeviceSize vram_reserve, enum vkd3d_bench_vram_class vram_class,
+        struct vkd3d_device_memory_allocation *allocation)
 {
     const VkMemoryPropertyFlags optional_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     HRESULT hr;
 
     hr = vkd3d_try_allocate_device_memory(device, size, type_flags,
             type_mask, pNext, respect_budget, vram_reserve, allocation);
+    if (vkd3d_bench_wants_vram(type_flags))
+    {
+        if (FAILED(hr))
+            vkd3d_bench_vram_short();
+        if (vram_class != VKD3D_BENCH_VRAM_COLD)
+            vkd3d_bench_note_vram(device, type_mask, size, FAILED(hr));
+    }
 
     if (FAILED(hr) && (type_flags & optional_flags))
     {
@@ -1284,6 +1331,8 @@ static HRESULT vkd3d_allocate_device_memory_reserve(struct d3d12_device *device,
         ERR("Failed to allocate device memory (size %"PRIu64", type_flags %#x, type_mask %#x).\n",
                 size, type_flags, type_mask);
     }
+    else if (vram_class == VKD3D_BENCH_VRAM_HOT && vkd3d_bench_wants_vram(type_flags))
+        vkd3d_bench_vram_hot(allocation->vk_memory, size);
 
     return hr;
 }
@@ -1293,7 +1342,7 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
         void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
 {
     return vkd3d_allocate_device_memory_reserve(device, size, type_flags, type_mask,
-            pNext, respect_budget, 0, allocation);
+            pNext, respect_budget, 0, VKD3D_BENCH_VRAM_OTHER, allocation);
 }
 
 static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_address,
@@ -1471,9 +1520,11 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     VkMemoryPropertyFlags type_flags;
     VkBindBufferMemoryInfo bind_info;
     void *host_ptr = info->host_ptr;
+    VkDeviceSize vram_reserve;
     void *dummy_mapping;
     uint32_t type_mask;
     bool request_bda;
+    enum vkd3d_bench_vram_class vram_class;
     VkResult vr;
     HRESULT hr;
 
@@ -1628,17 +1679,25 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     }
     else if (info->flags & VKD3D_ALLOCATION_FLAG_NO_FALLBACK)
     {
+        vram_reserve = vkd3d_bench_vram_reserve(&info->heap_properties, info->heap_flags, info->flags, &vram_class);
         hr = vkd3d_try_allocate_device_memory(device, memory_requirements.size, type_flags,
-                type_mask, &flags_info, true,
-                vkd3d_bench_vram_reserve(&info->heap_properties, info->heap_flags, info->flags),
-                &allocation->device_allocation);
+                type_mask, &flags_info, true, vram_reserve, &allocation->device_allocation);
+        if (vkd3d_bench_wants_vram(type_flags))
+        {
+            if (FAILED(hr))
+                vkd3d_bench_vram_short();
+            else if (vram_class == VKD3D_BENCH_VRAM_HOT)
+                vkd3d_bench_vram_hot(allocation->device_allocation.vk_memory, memory_requirements.size);
+            if (vram_class != VKD3D_BENCH_VRAM_COLD)
+                vkd3d_bench_note_vram(device, type_mask, memory_requirements.size, FAILED(hr));
+        }
     }
     else
     {
+        vram_reserve = vkd3d_bench_vram_reserve(&info->heap_properties, info->heap_flags, info->flags, &vram_class);
         hr = vkd3d_allocate_device_memory_reserve(device, memory_requirements.size, type_flags,
                 type_mask, &flags_info, allocation->heap_type == D3D12_HEAP_TYPE_UPLOAD,
-                vkd3d_bench_vram_reserve(&info->heap_properties, info->heap_flags, info->flags),
-                &allocation->device_allocation);
+                vram_reserve, vram_class, &allocation->device_allocation);
     }
 
     if (FAILED(hr))
@@ -2066,6 +2125,7 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
     D3D12_HEAP_TYPE normalized_heap_type;
     struct vkd3d_memory_chunk *chunk;
     VkDeviceSize vram_reserve;
+    enum vkd3d_bench_vram_class vram_class;
     bool vram_tight = false;
     HRESULT hr;
     size_t i;
@@ -2079,7 +2139,7 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
      * texture heaps) skip VRAM chunks once VRAM is within the reserve of the budget, the same
      * rule new chunks and dedicated allocations follow. Opt-in (VKD3D_BENCH_VRAM_RESERVE_CHUNKS=1):
      * with the kept VRAM reserve alone it sends more small textures to system memory and costs fps. */
-    if (vkd3d_bench_vram_reserve_chunks() && (vram_reserve = vkd3d_bench_vram_reserve(heap_properties, heap_flags, bench_flags)))
+    if (vkd3d_bench_vram_reserve_chunks() && (vram_reserve = vkd3d_bench_vram_reserve(heap_properties, heap_flags, bench_flags, &vram_class)))
     {
         for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
         {

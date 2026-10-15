@@ -11,9 +11,11 @@
  * render-thread frame (0x1da3200 -> 0x2162ff0). In play a half reaches ~11 MiB of its 98 MiB.
  *
  * Here that heap gets no memory of its own and the buffer is created as a sparse (reserved) buffer;
- * each half is backed from its start up to a bound that starts at VKD3D_BENCH_SKIN_INITIAL_MB
- * (default 32) and grows in 4 MiB chunks to stay VKD3D_BENCH_SKIN_MARGIN_MB (default 8) ahead of
- * the highest byte ever allocated in it. The engine's calls to 0x2162ef0 and 0x2162f20 (the
+ * each half is backed from its start up to a bound that starts one margin (VKD3D_BENCH_SKIN_MARGIN_MB,
+ * default 8) past the most bytes earlier sessions of this build used in a half (learned.c), or at the
+ * whole half, as the original heap, before anything was learned (VKD3D_BENCH_SKIN_INITIAL_MB
+ * overrides it), and grows in 4 MiB chunks to stay a margin ahead of the highest byte ever allocated
+ * in it. The engine's calls to 0x2162ef0 and 0x2162f20 (the
  * aligned variant, which the skinning code does not use but which is patched the same way) are
  * redirected to skinbuf_alloc / skinbuf_alloc_aligned below: the same atomic operations on the
  * same allocator, and before an allocation from a skinning half is returned to its caller, the
@@ -52,9 +54,11 @@ struct engine_linear
 };
 
 static int skin_enabled = -1;
-/* 32 MiB per half at creation: the chase reaches 25.6 MiB while VRAM is full (play-1013), and the
- * sparse buffer only takes VRAM-only memory types, so the room has to be there from the start. */
-static uint32_t skin_initial = 32u << 20, skin_margin = 8u << 20;
+/* The chase reached 25.6 MiB in a half while VRAM was full (play-1013), and the sparse buffer only
+ * takes VRAM-only memory types, so the room has to be there from the start: the backing made at
+ * creation covers the most earlier sessions used (learned.c), the whole half before anything was
+ * learned. skin_initial: VKD3D_BENCH_SKIN_INITIAL_MB, 0 = unset. */
+static uint32_t skin_initial, skin_margin = 8u << 20;
 static pthread_mutex_t skin_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct
@@ -109,7 +113,7 @@ static uint8_t *skin_engine_image(void)
 
 /* The skinning heap: CUSTOM / NOT_AVAILABLE / L1, buffers only, exactly the size the manager's init
  * computes from the engine's settings, with no frozen region. */
-bool vkd3d_skinbuf_heap_wanted(const D3D12_HEAP_DESC *desc)
+bool vkd3d_skinbuf_heap_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc)
 {
     uint32_t total, frozen, half;
     uint8_t *image;
@@ -127,6 +131,14 @@ bool vkd3d_skinbuf_heap_wanted(const D3D12_HEAP_DESC *desc)
     half = ((total - frozen) >> 1) & 0x7fffffc0u;
     if (frozen || !half || desc->SizeInBytes != (uint64_t)half * 2 || (half % SKIN_PAGE))
         return false;
+    /* Lazy backing is exact only if every allocation goes through skinbuf_alloc, and it needs sparse
+     * buffers; otherwise the heap keeps its memory (the redirected calls then act as the engine's). */
+    if (!vkd3d_engine_skin_hooked() || !vkd3d_bench_sparse_buffers(device))
+    {
+        INFO("skinning buffer: %s; the heap keeps its memory.\n",
+                vkd3d_engine_skin_hooked() ? "no sparse buffers" : "not every allocation is hooked");
+        return false;
+    }
     INFO("skinning buffer: heap of %u MiB (two %u MiB frame halves) gets no memory; its buffer is backed "
             "as the engine allocates.\n", (unsigned int)(desc->SizeInBytes >> 20), half >> 20);
     return true;
@@ -253,7 +265,11 @@ static void skin_ensure(unsigned int h, uint32_t end)
     pthread_mutex_lock(&skin_lock);
     if (skin.resource && !skin.broken)
     {
-        skin.highest[h] = max(skin.highest[h], end);
+        if (end > skin.highest[h])
+        {
+            skin.highest[h] = end;
+            vkd3d_bench_learned_raise(VKD3D_BENCH_LEARNED_SKIN_BYTES, end);
+        }
         if ((uint64_t)end + skin_margin / 2 > skin.bound[h] &&
                 (end > skin.bound[h] || vkd3d_get_current_time_ns() >= skin.retry_at))
             skin_grow(h, skin_target(end));
@@ -410,8 +426,10 @@ HRESULT vkd3d_skinbuf_create_placed(struct d3d12_device *device, struct d3d12_he
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkMemoryRequirements requirements;
     struct d3d12_resource *object;
+    const char *source = "setup failed";
     VkFenceCreateInfo fence_info;
-    uint32_t type_bits;
+    uint32_t type_bits, first;
+    uint64_t learned;
     uint8_t *image;
     HRESULT hr;
 
@@ -465,14 +483,29 @@ HRESULT vkd3d_skinbuf_create_placed(struct d3d12_device *device, struct d3d12_he
     {
         /* The halves are set up by the manager right after this returns (used = 0). */
         skin.resource = object;
-        skin_grow(0, skin_target(skin_initial > skin_margin ? skin_initial - skin_margin : 0));
-        skin_grow(1, skin_target(skin_initial > skin_margin ? skin_initial - skin_margin : 0));
+        if (skin_initial)
+        {
+            first = skin_target(skin_initial > skin_margin ? skin_initial - skin_margin : 0);
+            source = "VKD3D_BENCH_SKIN_INITIAL_MB";
+        }
+        else if (vkd3d_bench_learned_get(VKD3D_BENCH_LEARNED_SKIN_BYTES, &learned) && learned)
+        {
+            first = skin_target((uint32_t)min(learned, (uint64_t)skin.half_size));
+            source = "learned peak + margin";
+        }
+        else
+        {
+            first = skin.half_size;
+            source = "nothing learned yet: all of it";
+        }
+        skin_grow(0, first);
+        skin_grow(1, first);
     }
     pthread_mutex_unlock(&skin_lock);
 
-    INFO("skinning buffer: sparse, %u MiB, VA %#"PRIx64", memory type %u (types %#x), initial %u MiB "
-            "per half, margin %u MiB.\n", (unsigned int)(desc->Width >> 20), object->res.va, skin.memory_type,
-            skin.type_bits, skin_initial >> 20, skin_margin >> 20);
+    INFO("skinning buffer: sparse, %u MiB, VA %#"PRIx64", memory type %u (types %#x), initial %u / %u MiB "
+            "per half (%s), margin %u MiB.\n", (unsigned int)(desc->Width >> 20), object->res.va, skin.memory_type,
+            skin.type_bits, skin.bound[0] >> 20, skin.bound[1] >> 20, source, skin_margin >> 20);
     *resource = object;
     return S_OK;
 }
@@ -497,7 +530,11 @@ void vkd3d_skinbuf_update(void)
             if (!(skin.unbacked_checks++ % 100))
                 ERR("skinning buffer: LOSS: half %u has %#x bytes allocated, %#x backed (%"PRIu64" submissions so far).\n",
                         h, used, skin.bound[h], skin.unbacked_checks);
-            skin.highest[h] = max(skin.highest[h], used);
+            if (used > skin.highest[h])
+            {
+                skin.highest[h] = used;
+                vkd3d_bench_learned_raise(VKD3D_BENCH_LEARNED_SKIN_BYTES, used);
+            }
             if (vkd3d_get_current_time_ns() >= skin.retry_at)
                 skin_grow(h, skin_target(used));
         }
@@ -513,13 +550,16 @@ uint64_t vkd3d_skinbuf_budget_reserve(void)
 
     if (!skin.resource || skin.broken)
         return 0;
-    r = 2ull * skin_margin;
-    for (h = 0; h < 2; h++)
+    /* As for the light grid: per half, what backing three margins past the highest byte allocated
+     * (at most the half) or the bytes still wanted would add; nothing while the backing is well ahead. */
+    for (h = 0, r = 0; h < 2; h++)
     {
         uint32_t wanted = vkd3d_atomic_uint32_load_explicit(&skin.wanted[h], vkd3d_memory_order_relaxed);
         uint32_t bound = vkd3d_atomic_uint32_load_explicit(&skin.bound[h], vkd3d_memory_order_relaxed);
+        uint32_t highest = vkd3d_atomic_uint32_load_explicit(&skin.highest[h], vkd3d_memory_order_relaxed);
+        uint64_t target = max(min((uint64_t)highest + 3ull * skin_margin, (uint64_t)skin.half_size), (uint64_t)wanted);
 
-        r += wanted > bound ? wanted - bound : 0;
+        r += target > bound ? target - bound : 0;
     }
     return r;
 }

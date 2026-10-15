@@ -483,7 +483,7 @@ static HANDLE engine_pagemap = INVALID_HANDLE_VALUE;
 static size_t engine_dropdst_min = 16384;
 static struct
 {
-    uint64_t copies, fills, pinned, lz4, lz4_swapped, lz4_bad, reads, read_errors, pages, swapped, dropped, reset_errors, ns;
+    uint64_t copies, fills, pinned, noswap, lz4, lz4_swapped, lz4_bad, reads, read_errors, pages, swapped, dropped, reset_errors, ns;
 } engine_dropdst_stat;
 static uint64_t engine_dropdst_last_log;
 
@@ -552,6 +552,41 @@ static bool engine_pinned_contains(uintptr_t lo, uintptr_t hi)
     return ret;
 }
 
+/* Whether the game has anything in swap (VmSwap in /proc/<pid>/status), read again at most every
+ * 100 ms. With nothing swapped no page can need a reset, so the pagemap reads are skipped: on a
+ * machine with RAM to spare, always. A stale answer only costs a missed reset, never a wrong one. */
+static HANDLE engine_status = INVALID_HANDLE_VALUE;
+static uint64_t engine_swap_checked_ns;
+static bool engine_swap_used = true;
+
+static void __attribute__((noinline)) engine_swap_refresh(void)
+{
+    char buf[2048], *line;
+    OVERLAPPED ov;
+    DWORD got;
+
+    memset(&ov, 0, sizeof(ov));
+    if (!ReadFile(engine_status, buf, sizeof(buf) - 1, &got, &ov) || !got)
+        return;
+    buf[got] = 0;
+    if ((line = strstr(buf, "\nVmSwap:")))
+        __atomic_store_n(&engine_swap_used, strtoull(line + 8, NULL, 10) != 0, __ATOMIC_RELAXED);
+}
+
+static bool engine_swap_in_use(void)
+{
+    uint64_t now, at;
+
+    if (engine_status == INVALID_HANDLE_VALUE)
+        return true;
+    now = vkd3d_get_current_time_ns();
+    at = __atomic_load_n(&engine_swap_checked_ns, __ATOMIC_RELAXED);
+    if (now - at >= 100000000ull &&
+            __atomic_compare_exchange_n(&engine_swap_checked_ns, &at, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        engine_swap_refresh();
+    return __atomic_load_n(&engine_swap_used, __ATOMIC_RELAXED);
+}
+
 static void engine_reset_pages(uintptr_t first, uintptr_t end)
 {
     if (VirtualAlloc((void *)(first << 12), (end - first) << 12, MEM_RESET, PAGE_READWRITE))
@@ -571,6 +606,11 @@ static unsigned int engine_pagemap_swapped(uintptr_t lo, uintptr_t hi, bool drop
 
     if (hi <= lo || engine_pagemap == INVALID_HANDLE_VALUE)
         return 0;
+    if (!engine_swap_in_use())
+    {
+        DROPDST_ADD(noswap, 1);
+        return 0;
+    }
     if (engine_pinned_contains(lo, hi))
     {
         DROPDST_ADD(pinned, 1);
@@ -865,6 +905,7 @@ static void engine_patch_dropdst(uint8_t *image, uint32_t image_size)
     static const uint8_t memset_expect[] = {0x4c, 0x8b, 0xd9, 0x0f, 0xb6, 0xd2}; /* mov r11, rcx; movzx edx, dl */
     uint8_t *mc = image + 0x3b59ee0, *lz = image + 0x20cc4f0, *ms = image + 0x3b5a590, *cave, *p, *jb, *lc, *jl, *sc;
     unsigned int pid = 0;
+    WCHAR path[64];
     uint32_t min;
     int32_t rel;
     char env[32];
@@ -880,6 +921,10 @@ static void engine_patch_dropdst(uint8_t *image, uint32_t image_size)
         ERR("engine patch: did not find this process's /proc/<pid>/pagemap, not patching dropdst.\n");
         return;
     }
+    swprintf(path, ARRAY_SIZE(path), L"\\\\?\\unix\\proc\\%u\\status", pid);
+    if ((engine_status = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL))
+            == INVALID_HANDLE_VALUE)
+        ERR("engine patch: cannot read /proc/%u/status; dropdst checks the pagemap on every copy.\n", pid);
     if (vkd3d_get_env_var("VKD3D_BENCH_DROPDST_MIN", env, sizeof(env)) && atoi(env) >= 8192)
         engine_dropdst_min = atoi(env);
     min = engine_dropdst_min;
@@ -944,10 +989,11 @@ static void engine_dropdst_log(void)
     if (engine_pagemap == INVALID_HANDLE_VALUE || now - engine_dropdst_last_log < 10000000000ull)
         return;
     engine_dropdst_last_log = now;
-    INFO("dropdst: %"PRIu64" copies, %"PRIu64" fills, %"PRIu64" into pinned GPU memory, %"PRIu64" LZ4 blocks (%"PRIu64" onto swapped pages, %"PRIu64" undecodable); "
+    INFO("dropdst: %"PRIu64" copies, %"PRIu64" fills, %"PRIu64" into pinned GPU memory, %"PRIu64" skipped with nothing swapped, %"PRIu64" LZ4 blocks (%"PRIu64" onto swapped pages, %"PRIu64" undecodable); "
             "%"PRIu64" pagemap reads (%"PRIu64" failed), %"PRIu64" pages checked, %"PRIu64" swapped, %"PRIu64" reset "
             "(%"PRIu64" reset errors), %.1f ms in the hook.\n",
-            engine_dropdst_stat.copies, engine_dropdst_stat.fills, engine_dropdst_stat.pinned, engine_dropdst_stat.lz4, engine_dropdst_stat.lz4_swapped,
+            engine_dropdst_stat.copies, engine_dropdst_stat.fills, engine_dropdst_stat.pinned, engine_dropdst_stat.noswap,
+            engine_dropdst_stat.lz4, engine_dropdst_stat.lz4_swapped,
             engine_dropdst_stat.lz4_bad, engine_dropdst_stat.reads, engine_dropdst_stat.read_errors,
             engine_dropdst_stat.pages, engine_dropdst_stat.swapped, engine_dropdst_stat.dropped,
             engine_dropdst_stat.reset_errors, engine_dropdst_stat.ns / 1e6);
@@ -983,6 +1029,21 @@ static bool engine_redirect_call(uint8_t *image, uint32_t image_size, uint32_t s
     return true;
 }
 
+/* Set once every hook a feature relies on is in place (engine_patch_init runs at device creation,
+ * before the game creates a heap): without them the index cache and the lazy skinning buffer stay
+ * off, so an unknown exe build or a site that did not match leaves those heaps as they were. */
+static bool engine_geometry_hooked, engine_skin_hooked;
+
+bool vkd3d_engine_geometry_hooked(void)
+{
+    return engine_geometry_hooked;
+}
+
+bool vkd3d_engine_skin_hooked(void)
+{
+    return engine_skin_hooked;
+}
+
 /* Skinning buffer (skinbuf.c): every call of the engine's bump allocator (0x2162ef0, and its aligned
  * variant 0x2162f20) goes to skinbuf.c's copies, which do the same atomic operations and back the
  * pages of a skinning allocation before returning it. These are all the calls Ghidra finds (no
@@ -1002,7 +1063,10 @@ static void engine_patch_skin(uint8_t *image, uint32_t image_size)
         ERR("engine patch: only %u of %u bump allocator calls redirected; skinning allocations may go unbacked.\n",
                 done, (unsigned int)(ARRAY_SIZE(alloc_sites) + ARRAY_SIZE(aligned_sites)));
     else
+    {
+        engine_skin_hooked = true;
         INFO("engine patch: %u bump allocator calls go through skinbuf.c.\n", done);
+    }
 }
 
 /* Index cache invalidation (idxcache.c). The engine puts geometry into the ManagedBuffer heap
@@ -1057,6 +1121,7 @@ static void engine_patch_geometry_writes(uint8_t *image, uint32_t image_size)
         vkd3d_index_cache_disable("not every geometry writer is hooked");
         return;
     }
+    engine_geometry_hooked = true;
     vkd3d_geomirror_hooks_installed();
     INFO("engine patch: geometry writes reported to the index cache and the geometry mirror.\n");
 }

@@ -80,6 +80,7 @@ vkd3d_src = [
   'geomirror.c',
   'benchinput.c',
   'idxcache.c',
+  'learned.c',
   'lightgrid.c',
   'skinbuf.c',
   'meta.c',

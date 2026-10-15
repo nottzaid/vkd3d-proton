@@ -102,7 +102,7 @@ uint64_t vkd3d_bench_present_count(void)
     return __atomic_load_n(&idxc_frame, __ATOMIC_RELAXED);
 }
 
-bool vkd3d_index_cache_wanted(const D3D12_HEAP_DESC *desc)
+bool vkd3d_index_cache_wanted(struct d3d12_device *device, const D3D12_HEAP_DESC *desc)
 {
     char env[8];
 
@@ -116,12 +116,27 @@ bool vkd3d_index_cache_wanted(const D3D12_HEAP_DESC *desc)
         if (vkd3d_get_env_var("VKD3D_BENCH_INDEX_CACHE_MB", env, sizeof(env)) && atoi(env) > 0)
             idxc_size = (VkDeviceSize)atoi(env) << 20;
     }
-    return idxc_enabled && !idxc.src_buffer &&
-            desc->Properties.Type == D3D12_HEAP_TYPE_CUSTOM &&
-            desc->Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE &&
-            desc->Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L0 &&
-            (desc->Flags & D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS) == D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS &&
-            desc->SizeInBytes >= IDXC_MIN_SOURCE;
+    if (!idxc_enabled || idxc.src_buffer ||
+            desc->Properties.Type != D3D12_HEAP_TYPE_CUSTOM ||
+            desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE ||
+            desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_L0 ||
+            (desc->Flags & D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS) != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS ||
+            desc->SizeInBytes < IDXC_MIN_SOURCE)
+        return false;
+    /* Copies stay exact only while every geometry write is reported (enginepatch.c); an unknown
+     * exe build installs no hooks. With memory shared by CPU and GPU (UMA) the copy would be read
+     * from the same memory as the original: nothing to gain. */
+    if (!vkd3d_engine_geometry_hooked())
+    {
+        INFO("idxcache: the engine's geometry writes are not hooked; no index cache.\n");
+        return false;
+    }
+    if (d3d12_device_is_uma(device, NULL))
+    {
+        INFO("idxcache: CPU and GPU share memory; no index cache.\n");
+        return false;
+    }
+    return true;
 }
 
 /* Right after the geometry heap got its memory: allocate the VRAM cache now, at startup, so it
