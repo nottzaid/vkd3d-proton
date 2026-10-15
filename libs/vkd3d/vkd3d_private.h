@@ -1060,6 +1060,7 @@ struct vkd3d_index_cache_use
 {
     uint32_t first_page, pages, slot, gen;
     uint64_t frame;
+    uint64_t rel, size; /* the indices the draw reads: offset in the source, bytes */
 };
 bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
         VkBuffer *out_buffer, VkDeviceSize *out_offset, struct vkd3d_index_cache_use *use);
