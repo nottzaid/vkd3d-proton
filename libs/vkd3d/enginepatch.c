@@ -2184,6 +2184,25 @@ void vkd3d_frametrace_present(void)
                         "\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\n", (now - frametrace_t0) / 1e6, hits, misses, full, bytes >> 10,
                         used, stale, invalidations, verified, mismatched, scan_steps);
         }
+        {
+            uint32_t age[7];
+
+            /* IA t MiB of the index cache held by runs last drawn 0, 1, 2, 3, 4-7, 8+ presents
+             * ago, MiB free */
+            uint64_t req[7], fail[7];
+            uint32_t gap;
+
+            /* IS t requests then failures for runs of 1, 2, 3-4, 5-8, 9-16, 17-64, 65+ pages, largest
+             * evictable gap (pages) seen by a failed search */
+            if (vkd3d_index_cache_size_stats(req, fail, &gap))
+                fprintf(frametrace_file, "IS\t%.3f\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64
+                        "\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%"PRIu64"\t%u\n",
+                        (now - frametrace_t0) / 1e6, req[0], req[1], req[2], req[3], req[4], req[5], req[6],
+                        fail[0], fail[1], fail[2], fail[3], fail[4], fail[5], fail[6], gap);
+            if (vkd3d_index_cache_age_stats(age))
+                fprintf(frametrace_file, "IA\t%.3f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n", (now - frametrace_t0) / 1e6,
+                        age[0], age[1], age[2], age[3], age[4], age[5], age[6]);
+        }
         if (vkd3d_geomirror_active())
         {
             uint64_t bytes, runs, syncs, waits, scan_ns;

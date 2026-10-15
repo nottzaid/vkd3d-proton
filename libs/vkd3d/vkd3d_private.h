@@ -1051,6 +1051,10 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
         VkBuffer *out_buffer, VkDeviceSize *out_offset);
 void vkd3d_index_cache_flush(struct d3d12_device *device);
 void vkd3d_index_cache_present(void);
+/* Cache pages held by runs last drawn 0, 1, 2, 3, 4-7 and 8+ presents ago, then free pages (MiB). */
+bool vkd3d_index_cache_age_stats(uint32_t mib[7]);
+/* Allocation requests and failures per run size class since the last call, largest gap at a failure. */
+bool vkd3d_index_cache_size_stats(uint64_t req[7], uint64_t fail[7], uint32_t *gap);
 bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *full, uint64_t *bytes,
         uint32_t *used_mib, uint64_t *stale, uint64_t *invalidations, uint64_t *verified, uint64_t *mismatched,
         uint64_t *scan_steps);

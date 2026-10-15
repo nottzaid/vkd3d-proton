@@ -87,7 +87,16 @@ static struct
     uint64_t fail_frame;
     uint32_t fail_pages;
     uint64_t scan_steps;
+    /* Allocation requests and failures by run size (pages: 1, 2, 3-4, 5-8, 9-16, 17-64, 65+), and the
+     * largest free-or-evictable gap seen by a failed search (pages). Measurement only. */
+    uint64_t req_size[7], fail_size[7];
+    uint32_t fail_gap;
 } idxc;
+
+static unsigned int idxc_size_class(uint32_t pages)
+{
+    return pages <= 1 ? 0 : pages <= 2 ? 1 : pages <= 4 ? 2 : pages <= 8 ? 3 : pages <= 16 ? 4 : pages <= 64 ? 5 : 6;
+}
 
 static uint64_t idxc_frame;
 
@@ -273,10 +282,14 @@ static int32_t idxc_alloc_locked(uint32_t pages)
     uint32_t scanned = 0, head, i;
     int32_t run;
 
+    idxc.req_size[idxc_size_class(pages)]++;
     if (pages > idxc.cache_pages)
         return -1;
     if (idxc_failfast && idxc.fail_frame == frame + 1 && pages >= idxc.fail_pages)
+    {
+        idxc.fail_size[idxc_size_class(pages)]++;
         return -1;
+    }
     while (scanned < 2 * idxc.cache_pages)
     {
         idxc.scan_steps++;
@@ -300,21 +313,40 @@ static int32_t idxc_alloc_locked(uint32_t pages)
             idxc.cache_head = i;
             continue;
         }
-        /* Evict every run overlapping [head, head + pages), including ones starting earlier. */
+        /* Evict every run overlapping [head, head + pages), including ones starting earlier: all
+         * of its pages, from its first. (Comparing against run_of[i] while clearing freed only the
+         * pages up to i: the rest stayed tied to the run's first page and, once a new run started
+         * there, counted as part of it, so freed space looked drawn and the ring refused draws.) */
         for (i = head; i < head + pages; i++)
         {
-            if ((run = idxc.run_of[i]) < 0)
+            int32_t victim;
+
+            if ((victim = idxc.run_of[i]) < 0)
                 continue;
-            if (idxc.table[idxc.run_owner[run]].slot == (uint32_t)run + 1)
-                idxc.table[idxc.run_owner[run]].slot = 0;
-            while ((uint32_t)run < idxc.cache_pages && idxc.run_of[run] == idxc.run_of[i])
-                idxc.run_of[run++] = -1;
+            if (idxc.table[idxc.run_owner[victim]].slot == (uint32_t)victim + 1)
+                idxc.table[idxc.run_owner[victim]].slot = 0;
+            for (run = victim; (uint32_t)run < idxc.cache_pages && idxc.run_of[run] == victim; run++)
+                idxc.run_of[run] = -1;
         }
         for (i = head; i < head + pages; i++)
             idxc.run_of[i] = head;
         idxc.run_last[head] = frame;
         idxc.cache_head = head + pages;
         return head;
+    }
+    idxc.fail_size[idxc_size_class(pages)]++;
+    {
+        uint32_t gap = 0, best = 0;
+
+        for (i = 0; i < idxc.cache_pages; i++)
+        {
+            run = idxc.run_of[i];
+            if (run >= 0 && idxc.run_last[run] + IDXC_REUSE_FRAMES > frame)
+                gap = 0;
+            else if (++gap > best)
+                best = gap;
+        }
+        idxc.fail_gap = max(idxc.fail_gap, best);
     }
     /* Stored as frame + 1 so that 0 (zero-initialized) never matches present 0. */
     if (idxc.fail_frame != frame + 1 || pages < idxc.fail_pages)
@@ -436,6 +468,55 @@ void vkd3d_index_cache_flush(struct d3d12_device *device)
                 idxc.cache.resource.vk_buffer, idxc.pending[i].dst, idxc.pending[i].size, false);
     idxc.pending_count = 0;
     pthread_mutex_unlock(&idxc_lock);
+}
+
+bool vkd3d_index_cache_size_stats(uint64_t req[7], uint64_t fail[7], uint32_t *gap)
+{
+    unsigned int i;
+
+    if (!idxc.cache_ok)
+        return false;
+    pthread_mutex_lock(&idxc_lock);
+    for (i = 0; i < 7; i++)
+    {
+        req[i] = idxc.req_size[i];
+        fail[i] = idxc.fail_size[i];
+        idxc.req_size[i] = idxc.fail_size[i] = 0;
+    }
+    *gap = idxc.fail_gap;
+    idxc.fail_gap = 0;
+    pthread_mutex_unlock(&idxc_lock);
+    return true;
+}
+
+bool vkd3d_index_cache_age_stats(uint32_t mib[7])
+{
+    uint64_t frame, pages[7] = {0}, age;
+    uint32_t i, end, b;
+    int32_t run;
+
+    if (!idxc.cache_ok)
+        return false;
+    pthread_mutex_lock(&idxc_lock);
+    frame = __atomic_load_n(&idxc_frame, __ATOMIC_RELAXED);
+    for (i = 0; i < idxc.cache_pages; i = end)
+    {
+        end = i + 1;
+        if ((run = idxc.run_of[i]) < 0)
+        {
+            pages[6]++;
+            continue;
+        }
+        while (end < idxc.cache_pages && idxc.run_of[end] == run)
+            end++;
+        age = frame >= idxc.run_last[run] ? frame - idxc.run_last[run] : 0;
+        b = age < 4 ? (uint32_t)age : (age < 8 ? 4 : 5);
+        pages[b] += end - i;
+    }
+    pthread_mutex_unlock(&idxc_lock);
+    for (b = 0; b < 7; b++)
+        mib[b] = (uint32_t)((pages[b] << idxc_page_shift) >> 20);
+    return true;
 }
 
 bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *full, uint64_t *bytes,
