@@ -49,7 +49,10 @@ struct idxc_copy
     VkDeviceSize src, dst, size;
 };
 
-static pthread_mutex_t idxc_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Exclusive for everything that changes the cache; shared for hits (vkd3d_index_cache_lookup), so recording
+ * threads do not wait on each other: the exclusive lock contended there (~3% of the render thread). A zeroed
+ * SRW lock is an initialized one. */
+static rwlock_t idxc_lock;
 static int idxc_enabled = -1;
 /* VKD3D_BENCH_INDEX_CACHE_VERIFY=1: the cache lives in CPU-readable memory and every 16th hit on a
  * run copied at least 4 presents ago is compared byte for byte with the source. A mismatch means a
@@ -157,7 +160,7 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
     struct vkd3d_allocate_heap_memory_info alloc_info;
     size_t src_pages;
 
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     if (!idxc.cache_ok)
     {
         memset(&alloc_info, 0, sizeof(alloc_info));
@@ -177,7 +180,7 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
         if (FAILED(vkd3d_allocate_heap_memory(device, &device->memory_allocator, &alloc_info, &idxc.cache)))
         {
             ERR("idxcache: failed to allocate the %"PRIu64" MiB cache.\n", (uint64_t)(idxc_size >> 20));
-            pthread_mutex_unlock(&idxc_lock);
+            rwlock_unlock_write(&idxc_lock);
             return;
         }
         idxc.cache_pages = idxc_size >> idxc_page_shift;
@@ -187,7 +190,7 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
                 !(idxc.run_gen = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_gen))) ||
                 !(idxc.run_copied = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_copied))))
         {
-            pthread_mutex_unlock(&idxc_lock);
+            rwlock_unlock_write(&idxc_lock);
             return;
         }
         memset(idxc.run_of, 0xff, idxc.cache_pages * sizeof(*idxc.run_of));
@@ -198,7 +201,7 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
     if (!(idxc.table = vkd3d_calloc(src_pages, sizeof(*idxc.table))) ||
             !(idxc.page_gen = vkd3d_calloc(src_pages, sizeof(*idxc.page_gen))))
     {
-        pthread_mutex_unlock(&idxc_lock);
+        rwlock_unlock_write(&idxc_lock);
         return;
     }
     idxc.heap = heap;
@@ -208,7 +211,7 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
     idxc.src_cpu = heap->allocation.cpu_address;
     idxc.gen = 1;
     idxc.cache_head = 0;
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
 
     INFO("idxcache: source heap %p (%"PRIu64" MiB, memory type %u), cache %"PRIu64" MiB memory type %u, %u byte pages.\n",
             (void *)heap, (uint64_t)(idxc.src_size >> 20), heap->allocation.device_allocation.vk_memory_type,
@@ -217,7 +220,7 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
 
 void vkd3d_index_cache_unregister(struct d3d12_heap *heap)
 {
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     if (idxc.heap == heap)
     {
         vkd3d_free(idxc.table);
@@ -229,7 +232,7 @@ void vkd3d_index_cache_unregister(struct d3d12_heap *heap)
         idxc.src_buffer = VK_NULL_HANDLE;
         idxc.pending_count = 0;
     }
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
 }
 
 bool vkd3d_index_cache_is_source(VkBuffer buffer)
@@ -245,7 +248,7 @@ void vkd3d_index_cache_invalidate_cpu(const void *address, uint64_t size)
 
     if (!idxc.src_cpu || !size || p < idxc.src_cpu || p >= idxc.src_cpu + idxc.src_size)
         return;
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     if (idxc.page_gen && p >= idxc.src_cpu && p < idxc.src_cpu + idxc.src_size)
     {
         size = min(size, (uint64_t)(idxc.src_cpu + idxc.src_size - p));
@@ -256,7 +259,7 @@ void vkd3d_index_cache_invalidate_cpu(const void *address, uint64_t size)
             idxc.page_gen[i] = g;
         idxc.invalidations++;
     }
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
 }
 
 /* Cached copies could go stale behind the cache's back (a GPU write into the source heap, or a
@@ -372,17 +375,64 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
     if (!size)
         return false;
 
-    pthread_mutex_lock(&idxc_lock);
+    /* A hit on a fresh run, under the shared lock: the table, the generations and the runs only change under
+     * the exclusive lock, so what is checked here stays true until the unlock. The run's last-drawn present
+     * is the one thing a hit writes; evictions read it under the exclusive lock. Anything else (a miss, a
+     * stale run, verify mode) takes the exclusive lock and the full path below. */
+    if (!idxc_verify && !use)
+    {
+        rwlock_lock_read(&idxc_lock);
+        if (buffer == idxc.src_buffer && idxc.table && offset >= idxc.src_offset && !idxc.disabled &&
+                offset - idxc.src_offset + size <= idxc.src_size)
+        {
+            uint32_t i, g, slot;
+
+            rel = offset - idxc.src_offset;
+            p0 = rel >> idxc_page_shift;
+            pages = ((rel + size - 1) >> idxc_page_shift) - p0 + 1;
+            e = &idxc.table[p0];
+            if ((slot = e->slot) && e->pages >= pages)
+            {
+                g = idxc.run_gen[slot - 1];
+                for (i = 0; i < pages; i++)
+                {
+                    if (idxc.page_gen[p0 + i] > g)
+                        break;
+                }
+                if (i == pages)
+                {
+                    /* Raise only: another hit may have stored a later present since we loaded ours, and
+                     * run_last going backwards would let eviction (and the failfast) see the run as older
+                     * than it is. Usually already current, so usually no write. */
+                    uint64_t f = __atomic_load_n(&idxc_frame, __ATOMIC_RELAXED);
+                    uint64_t last = __atomic_load_n(&idxc.run_last[slot - 1], __ATOMIC_RELAXED);
+
+                    while (last < f && !__atomic_compare_exchange_n(&idxc.run_last[slot - 1], &last, f, true,
+                            __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                        ;
+                    __atomic_add_fetch(&idxc.hits, 1, __ATOMIC_RELAXED);
+                    *out_buffer = idxc.cache.resource.vk_buffer;
+                    *out_offset = idxc.cache.offset + ((VkDeviceSize)(slot - 1) << idxc_page_shift) +
+                            (rel - ((VkDeviceSize)p0 << idxc_page_shift));
+                    rwlock_unlock_read(&idxc_lock);
+                    return true;
+                }
+            }
+        }
+        rwlock_unlock_read(&idxc_lock);
+    }
+
+    rwlock_lock_write(&idxc_lock);
     if (buffer != idxc.src_buffer || !idxc.table || offset < idxc.src_offset || idxc.disabled)
     {
-        pthread_mutex_unlock(&idxc_lock);
+        rwlock_unlock_write(&idxc_lock);
         return false;
     }
     rel = offset - idxc.src_offset;
     end = rel + size;
     if (end > idxc.src_size)
     {
-        pthread_mutex_unlock(&idxc_lock);
+        rwlock_unlock_write(&idxc_lock);
         return false;
     }
     p0 = rel >> idxc_page_shift;
@@ -432,7 +482,7 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
                 idxc.pending_count + 1, sizeof(*idxc.pending)) || (first = idxc_alloc_locked(pages)) < 0)
         {
             idxc.full++;
-            pthread_mutex_unlock(&idxc_lock);
+            rwlock_unlock_write(&idxc_lock);
             return false;
         }
         e->pages = pages;
@@ -463,7 +513,7 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
         use->rel = rel;
         use->size = size;
     }
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
     return true;
 }
 
@@ -493,7 +543,7 @@ void vkd3d_index_cache_check_submit(const struct vkd3d_index_cache_use *uses, si
     size_t i;
     uint32_t j;
 
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     for (i = 0; i < count && idxc.table; i++)
     {
         u = &uses[i];
@@ -531,7 +581,7 @@ void vkd3d_index_cache_check_submit(const struct vkd3d_index_cache_use *uses, si
                 "byte for byte (%"PRIu64" differ), %"PRIu64" too fresh to compare, %"PRIu64" submitted late; page-level: "
                 "%"PRIu64" repointed, %"PRIu64" pages written since.\n", checked, reused, compared, differ, fresh,
                 late, repointed, written);
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
 }
 
 /* Start of every ExecuteCommandLists, before the memory transfer queue is flushed. */
@@ -541,12 +591,12 @@ void vkd3d_index_cache_flush(struct d3d12_device *device)
 
     if (!idxc.pending_count)
         return;
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     for (i = 0; i < idxc.pending_count; i++)
         vkd3d_memory_transfer_queue_copy_buffer(&device->memory_transfers, idxc.src_buffer, idxc.pending[i].src,
                 idxc.cache.resource.vk_buffer, idxc.pending[i].dst, idxc.pending[i].size, false);
     idxc.pending_count = 0;
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
 }
 
 bool vkd3d_index_cache_size_stats(uint64_t req[7], uint64_t fail[7], uint32_t *gap)
@@ -555,7 +605,7 @@ bool vkd3d_index_cache_size_stats(uint64_t req[7], uint64_t fail[7], uint32_t *g
 
     if (!idxc.cache_ok)
         return false;
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     for (i = 0; i < 7; i++)
     {
         req[i] = idxc.req_size[i];
@@ -564,7 +614,7 @@ bool vkd3d_index_cache_size_stats(uint64_t req[7], uint64_t fail[7], uint32_t *g
     }
     *gap = idxc.fail_gap;
     idxc.fail_gap = 0;
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
     return true;
 }
 
@@ -576,7 +626,7 @@ bool vkd3d_index_cache_age_stats(uint32_t mib[7])
 
     if (!idxc.cache_ok)
         return false;
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     frame = __atomic_load_n(&idxc_frame, __ATOMIC_RELAXED);
     for (i = 0; i < idxc.cache_pages; i = end)
     {
@@ -592,7 +642,7 @@ bool vkd3d_index_cache_age_stats(uint32_t mib[7])
         b = age < 4 ? (uint32_t)age : (age < 8 ? 4 : 5);
         pages[b] += end - i;
     }
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
     for (b = 0; b < 7; b++)
         mib[b] = (uint32_t)((pages[b] << idxc_page_shift) >> 20);
     return true;
@@ -604,7 +654,7 @@ bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *fu
 {
     if (!idxc.cache_ok)
         return false;
-    pthread_mutex_lock(&idxc_lock);
+    rwlock_lock_write(&idxc_lock);
     *hits = idxc.hits;
     *misses = idxc.misses;
     *full = idxc.full;
@@ -618,6 +668,6 @@ bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *fu
     idxc.scan_steps = 0;
     idxc.verified = 0; /* mismatched stays cumulative */
     idxc.hits = idxc.misses = idxc.full = idxc.bytes = idxc.stale = idxc.invalidations = 0;
-    pthread_mutex_unlock(&idxc_lock);
+    rwlock_unlock_write(&idxc_lock);
     return true;
 }

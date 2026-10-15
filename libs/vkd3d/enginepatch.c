@@ -1488,7 +1488,9 @@ void vkd3d_frametrace_count_draw(struct d3d12_command_list *list)
 
     if (!frametrace_file)
         return;
-    __atomic_fetch_add(&frametrace_draws, 1, __ATOMIC_RELAXED);
+    /* Counted in the list (one thread records a list) and added up at submission: one global atomic per
+     * draw, from every recording thread, cost 4% of the render thread (its cache line bounced). */
+    list->bench_draws++;
     /* Per-target runs (R lines) only with VKD3D_FRAMETRACE_DETAIL=1: the run bookkeeping (a lock and
      * a private-data name lookup on every target change) cost 3.6% of the render thread. */
     if (!frametrace_detail || !(tls = engine_tls_get()))
@@ -1530,6 +1532,12 @@ void vkd3d_frametrace_count_draw(struct d3d12_command_list *list)
             strcpy(tls->run.name, "(compute or no target)");
     }
     tls->run.draws++;
+}
+
+void vkd3d_frametrace_submit_draws(struct d3d12_command_list *list)
+{
+    if (list->bench_draws)
+        __atomic_fetch_add(&frametrace_draws, list->bench_draws, __ATOMIC_RELAXED);
 }
 
 /* E t then free text: timestamped events from the bench's other patches (light grid and skinning

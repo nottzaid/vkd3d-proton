@@ -3559,6 +3559,11 @@ struct d3d12_command_list
 
     struct vkd3d_index_buffer index_buffer;
     bool index_buffer_cacheable; /* idxcache.c: the bound IB lives in the geometry heap */
+    /* idxcache.c: the index cache buffer is bound whole (offset 0) with this index type; cached draws then
+     * only set firstIndex. VK_NULL_HANDLE whenever anything else may have changed the binding. */
+    VkBuffer bench_idxc_bound;
+    VkIndexType bench_idxc_bound_type;
+    VkCommandBuffer bench_idxc_bound_cb; /* bindings are per command buffer */
     struct vkd3d_particle_batch particle;
     struct vkd3d_pdraw pdraw;
     /* miles-bench lazy heaps: heaps this list bound while they still shared the null heap. */
@@ -3571,6 +3576,7 @@ struct d3d12_command_list
     struct vkd3d_ck_list_heap *bench_ck_heaps;
     size_t bench_ck_heap_count, bench_ck_heaps_size;
     bool bench_ck_submitted;
+    uint32_t bench_draws; /* frame trace: draws recorded, added to the frame's count at submission */
     /* idxcache.c verify mode: the cached runs this list's draws were recorded against */
     struct vkd3d_index_cache_use *bench_idxc_uses;
     size_t bench_idxc_use_count, bench_idxc_uses_size;
@@ -7444,6 +7450,7 @@ uint32_t vkd3d_bench_features(void);
 void vkd3d_bench_pinned_add(const void *ptr, uint64_t size);
 void vkd3d_bench_pinned_remove(const void *ptr);
 void vkd3d_frametrace_count_draw(struct d3d12_command_list *list);
+void vkd3d_frametrace_submit_draws(struct d3d12_command_list *list);
 void vkd3d_frametrace_marker(UINT metadata, const void *data, UINT size);
 void vkd3d_frametrace_event(const char *fmt, ...) VKD3D_PRINTF_FUNC(1, 2);
 void vkd3d_frametrace_bind_heap(struct d3d12_descriptor_heap *heap);

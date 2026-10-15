@@ -1351,7 +1351,7 @@ static HRESULT d3d12_fence_signal_cpu_timeline_semaphore(struct d3d12_fence *fen
         return hresult_from_errno(rc);
     }
 
-    fence->virtual_value = value;
+    __atomic_store_n(&fence->virtual_value, value, __ATOMIC_RELEASE);
     d3d12_fence_signal_external_events_locked(fence, NULL);
     d3d12_fence_update_wait_tickets_locked(fence);
     d3d12_fence_update_pending_value_locked_and_broadcast(fence);
@@ -1433,7 +1433,7 @@ static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_
         {
             if (fence->signal_count == fence->pending_updates[i].update_count)
             {
-                fence->virtual_value = fence->pending_updates[i].virtual_value;
+                __atomic_store_n(&fence->virtual_value, fence->pending_updates[i].virtual_value, __ATOMIC_RELEASE);
                 d3d12_fence_signal_external_events_locked(fence, worker);
                 d3d12_fence_update_wait_tickets_locked(fence);
                 fence->pending_updates[i] = fence->pending_updates[--fence->pending_updates_count];
@@ -1575,17 +1575,13 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface 
 {
     struct d3d12_fence *fence = impl_from_ID3D12Fence1(iface);
     uint64_t completed_value;
-    int rc;
 
     TRACE("iface %p.\n", iface);
 
-    if ((rc = pthread_mutex_lock(&fence->mutex)))
-    {
-        ERR("Failed to lock mutex, error %d.\n", rc);
-        return 0;
-    }
-    completed_value = fence->virtual_value;
-    pthread_mutex_unlock(&fence->mutex);
+    /* miles-bench: the game polls its fences constantly, and taking fence->mutex here contended with the
+     * fence worker (5% of the render thread). Every store to virtual_value is a release under the mutex,
+     * so an acquire load reads the same snapshot the locked read did, with what the signal published. */
+    completed_value = __atomic_load_n(&fence->virtual_value, __ATOMIC_ACQUIRE);
     if (vkd3d_engine_spin_patched)
         vkd3d_engine_note_fence_poll(fence, completed_value);
     return completed_value;
@@ -4986,10 +4982,27 @@ static bool d3d12_command_list_ck_add_event(struct d3d12_command_list *list, str
 /* Every use of a resource in a list (d3d12_command_list_track_resource_usage). */
 static void d3d12_command_list_ck_use(struct d3d12_command_list *list, struct d3d12_resource *resource)
 {
+    struct vkd3d_ck_list_heap *h;
     struct vkd3d_ck_heap *ck;
+    size_t i;
 
     if (!(ck = d3d12_resource_ck_heap(resource)) || __atomic_load_n(&ck->ineligible, __ATOMIC_ACQUIRE))
         return;
+    /* A use repeating the list's last use of the heap is not stored (d3d12_command_list_ck_add_event): the
+     * list's records belong to the recording thread, so that needs no lock. */
+    if (list->type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+    {
+        for (i = 0; i < list->bench_ck_heap_count; i++)
+        {
+            h = &list->bench_ck_heaps[i];
+            if (h->heap == ck)
+            {
+                if (h->last_id == resource->bench_ck_id)
+                    return;
+                break;
+            }
+        }
+    }
     pthread_mutex_lock(&vkd3d_ck_lock);
     if (list->type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         vkd3d_ck_disqualify(ck, "a heap with kept clears is used from a non-direct list");
@@ -7665,6 +7678,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
     list->index_buffer.buffer = VK_NULL_HANDLE;
     list->index_buffer.is_dirty = true;
     list->index_buffer_cacheable = false;
+    list->bench_idxc_bound = VK_NULL_HANDLE;
 
     list->current_pipeline = VK_NULL_HANDLE;
     list->command_buffer_pipeline = VK_NULL_HANDLE;
@@ -7725,6 +7739,7 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
 
     list->has_replaced_shaders = false;
     d3d12_command_list_ck_reset(list);
+    list->bench_draws = 0;
     list->bench_idxc_use_count = 0;
     list->pdraw.redirect_count = list->pdraw.check_count = 0;
     list->bench_borrowed_bound_count = 0;
@@ -7765,6 +7780,7 @@ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list)
     d3d12_command_list_invalidate_root_parameters(list, &list->graphics_bindings, true, NULL);
     d3d12_command_list_invalidate_root_parameters(list, &list->compute_bindings, true, NULL);
     list->index_buffer.is_dirty = true;
+    list->bench_idxc_bound = VK_NULL_HANDLE;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_command_list_Reset(d3d12_command_list_iface *iface,
@@ -9801,6 +9817,7 @@ static bool d3d12_command_list_update_index_buffer(struct d3d12_command_list *li
             VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, VK_NULL_HANDLE, 0, 0, VK_INDEX_TYPE_UINT16));
         }
         list->index_buffer.is_dirty = false;
+        list->bench_idxc_bound = VK_NULL_HANDLE;
     }
 
     return true;
@@ -9847,10 +9864,29 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
             if (verify && vkd3d_array_reserve((void **)&list->bench_idxc_uses, &list->bench_idxc_uses_size,
                     list->bench_idxc_use_count + 1, sizeof(*list->bench_idxc_uses)))
                 list->bench_idxc_uses[list->bench_idxc_use_count++] = use;
-            VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, cache_buffer, cache_offset, size,
-                    list->index_buffer.vk_type));
-            list->index_buffer.is_dirty = true; /* the next draw binds the game's buffer again */
-            start_vertex_location = 0;
+            /* The cache buffer is bound whole once and cached draws pass their offset as firstIndex (the
+             * same indices are read): one bind per run of cached draws instead of one per draw. */
+            if (!(cache_offset % index_size) && cache_offset / index_size <= UINT32_MAX)
+            {
+                if (list->bench_idxc_bound != cache_buffer || list->bench_idxc_bound_type != list->index_buffer.vk_type ||
+                        list->bench_idxc_bound_cb != list->cmd.vk_command_buffer)
+                {
+                    VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, cache_buffer, 0, VK_WHOLE_SIZE,
+                            list->index_buffer.vk_type));
+                    list->bench_idxc_bound = cache_buffer;
+                    list->bench_idxc_bound_type = list->index_buffer.vk_type;
+                    list->bench_idxc_bound_cb = list->cmd.vk_command_buffer;
+                }
+                start_vertex_location = cache_offset / index_size;
+            }
+            else
+            {
+                VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, cache_buffer, cache_offset, size,
+                        list->index_buffer.vk_type));
+                list->bench_idxc_bound = VK_NULL_HANDLE;
+                start_vertex_location = 0;
+            }
+            list->index_buffer.is_dirty = true; /* the next uncached draw binds the game's buffer again */
         }
         else if (!d3d12_command_list_update_index_buffer(list))
             return;
@@ -16719,6 +16755,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
         d3d12_command_list_pdraw_check_va(list, view->BufferLocation, view->SizeInBytes);
     list->index_buffer.is_dirty = true;
     list->index_buffer_cacheable = false;
+    list->bench_idxc_bound = VK_NULL_HANDLE;
 
     if (view)
         vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_IB, view->BufferLocation, view->SizeInBytes);
@@ -19404,6 +19441,7 @@ static void d3d12_command_list_clear_signature_state(
                 /* Null IBO */
                 list->index_buffer.buffer = VK_NULL_HANDLE;
                 list->index_buffer.is_dirty = true;
+                list->bench_idxc_bound = VK_NULL_HANDLE;
                 break;
 
             case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
@@ -25556,6 +25594,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     {
         cmd_list = unsafe_impl_from_ID3D12CommandList(command_lists[i]);
         d3d12_command_list_ck_submit(cmd_list, command_queue);
+        vkd3d_frametrace_submit_draws(cmd_list);
         if (cmd_list->bench_idxc_use_count)
             vkd3d_index_cache_check_submit(cmd_list->bench_idxc_uses, cmd_list->bench_idxc_use_count);
     }
