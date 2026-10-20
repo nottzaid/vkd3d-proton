@@ -7473,6 +7473,11 @@ void vkd3d_frametrace_event(const char *fmt, ...) VKD3D_PRINTF_FUNC(1, 2);
 void vkd3d_frametrace_bind_heap(struct d3d12_descriptor_heap *heap);
 void vkd3d_frametrace_viewport(float width, float height);
 void vkd3d_gputime_install(struct d3d12_device *device);
+/* cmdreplay.c: command lists record through a replay worker (VKD3D_BENCH_CMD_REPLAY=1). */
+void vkd3d_cmd_replay_install(struct d3d12_device *device);
+void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool);
+void vkd3d_cmd_replay_report(void);
+bool vkd3d_cmd_replay_enabled(void);
 void vkd3d_gputime_present(void);
 void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
 void vkd3d_gputime_ecl(VkCommandBuffer cmd);

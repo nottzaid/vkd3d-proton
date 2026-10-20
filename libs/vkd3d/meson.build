@@ -77,6 +77,7 @@ vkd3d_src = [
   'memtrace.c',
   'enginepatch.c',
   'gputime.c',
+  'cmdreplay.c',
   'geomirror.c',
   'benchinput.c',
   'idxcache.c',

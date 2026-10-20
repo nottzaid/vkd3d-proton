@@ -3386,6 +3386,11 @@ static HRESULT d3d12_command_allocator_init(struct d3d12_command_allocator *allo
 
     /* GRAPHICS/COMPUTE queue must support (1, 1, 1) granularity. */
 
+    /* miles-bench: this allocator's command buffers record through the replay worker (cmdreplay.c). Pools
+     * recycled through the device's cache were registered when created; registering is idempotent. */
+    vkd3d_cmd_replay_register_pool(allocator->primary_pool.vk_command_pool);
+    vkd3d_cmd_replay_register_pool(allocator->fallback_pool.vk_command_pool);
+
     d3d_destruction_notifier_init(&allocator->destruction_notifier,
             (IUnknown*)&allocator->ID3D12CommandAllocator_iface);
     d3d12_device_add_ref(allocator->device = device);

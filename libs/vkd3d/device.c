@@ -4221,6 +4221,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
 
     device->vk_device = vk_device;
     vkd3d_gputime_install(device);
+    vkd3d_cmd_replay_install(device);
 
     if (FAILED(hr = d3d12_device_create_vkd3d_queues(device, &device_queue_info)))
     {

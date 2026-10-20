@@ -1138,6 +1138,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     vkd3d_frametrace_present();
     vkd3d_index_cache_present();
     vkd3d_gputime_present();
+    vkd3d_cmd_replay_report();
 
     assert(chain->user.index < chain->desc.BufferCount);
 
