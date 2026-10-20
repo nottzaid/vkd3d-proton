@@ -3538,11 +3538,23 @@ static void vkd3d_report_pipeline_creation_feedback_results(const VkPipelineCrea
 
 /* miles-bench: pipeline compiles that take a while, on the frame trace's clock (which thread, how
  * long, which PSO), to tell shader-compile stalls from everything else. */
+static bool vkd3d_bench_gpl_probe(void)
+{
+    static int probe = -1;
+    char value[8];
+
+    if (probe < 0)
+        probe = vkd3d_get_env_var("VKD3D_BENCH_GPL_PROBE", value, sizeof(value)) && *value == '1';
+    return probe;
+}
+
 static void vkd3d_bench_pso_event(const char *kind, uint64_t t0, struct d3d12_pipeline_state *state, VkResult vr)
 {
     uint64_t ns = vkd3d_get_current_time_ns() - t0;
 
-    if (ns >= 2000000)
+    /* VKD3D_BENCH_GPL_PROBE logs every graphics compile, so library + link can be set against the
+     * monolithic compile of the same PSO. */
+    if (ns >= 2000000 || (vkd3d_bench_gpl_probe() && !strncmp(kind, "graphics", 8)))
         vkd3d_frametrace_event("pso %s %.3f ms vr %d pso %016"PRIx64" tid %04x", kind, ns / 1e6, vr,
                 vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), (unsigned int)GetCurrentThreadId());
 }
@@ -3647,6 +3659,8 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
             vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
     vkd3d_bench_pso_event("compute", pso_t0, state, vr);
+    state->bench_created_ns = vkd3d_get_current_time_ns();
+    state->bench_compile_us = (state->bench_created_ns - pso_t0) / 1000;
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -6177,6 +6191,10 @@ static HRESULT d3d12_pipeline_state_init_graphics_spirv(struct d3d12_pipeline_st
     return d3d12_pipeline_state_graphics_handle_meta(state, device);
 }
 
+static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline_state *state,
+        const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
+        uint32_t dynamic_state_flags, bool lto, VkPipeline *vk_pipeline);
+
 static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_state *state,
         const struct d3d12_pipeline_state_desc *desc)
 {
@@ -6243,11 +6261,33 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
     graphics->library_flags = 0;
     graphics->library_create_flags = 0;
 
+    /* VKD3D_BENCH_GPL_PROBE: build every plain PSO as a shader library (pre-rasterization + fragment
+     * shader), time a fast link of it (thrown away), then link the pipeline that is used with LTO as
+     * usual. Measurement only: what a never-seen PSO would cost on the creating thread with GPL. */
+    if (vkd3d_bench_gpl_probe() && has_gpl && !create_library && can_compile_pipeline_early &&
+            !(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+            !(graphics->stage_flags & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT))
+    {
+        library_flags = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+        create_library = true;
+    }
+
     if (create_library && has_gpl)
     {
         if (!(graphics->library = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
                 state->vk_pso_cache, library_flags, &graphics->pipeline_dynamic_states)))
             return E_OUTOFMEMORY;
+
+        if (vkd3d_bench_gpl_probe() && can_compile_pipeline_early)
+        {
+            const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
+            VkPipeline fast = VK_NULL_HANDLE;
+
+            if (d3d12_pipeline_state_link_pipeline_variant(state, NULL, graphics->dsv_format, state->vk_pso_cache,
+                    graphics->pipeline_dynamic_states, false, &fast) == VK_SUCCESS)
+                VK_CALL(vkDestroyPipeline(state->device->vk_device, fast, NULL));
+        }
     }
 
     if (can_compile_pipeline_early)
@@ -6781,7 +6821,7 @@ static void d3d12_pipeline_state_log_graphics_state(const struct d3d12_pipeline_
 
 static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
-        uint32_t dynamic_state_flags, VkPipeline *vk_pipeline)
+        uint32_t dynamic_state_flags, bool lto, VkPipeline *vk_pipeline)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
@@ -6834,7 +6874,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     /* Only use LINK_TIME_OPTIMIZATION for the primary pipeline for now,
      * accept a small runtime perf hit on subsequent compiles in order
      * to avoid stutter. */
-    if (!key)
+    if (lto)
         flags2.flags |= VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT;
 
     cookie = vkd3d_queue_timeline_trace_register_pso_compile(&state->device->queue_timeline_trace);
@@ -6850,7 +6890,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     pso_t0 = vkd3d_get_current_time_ns();
     vr = VK_CALL(vkCreateGraphicsPipelines(state->device->vk_device,
             vk_cache, 1, &create_info, NULL, vk_pipeline));
-    vkd3d_bench_pso_event("graphics link", pso_t0, state, vr);
+    vkd3d_bench_pso_event(lto ? "graphics link" : "graphics fastlink", pso_t0, state, vr);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -6904,7 +6944,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     if (!library_flags && graphics->library)
     {
         if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
-                vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
+                vk_cache, *dynamic_state_flags, !key, &vk_pipeline) == VK_SUCCESS)
             return vk_pipeline;
     }
 
@@ -7067,7 +7107,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
 
     pso_t0 = vkd3d_get_current_time_ns();
     vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
-    vkd3d_bench_pso_event(key ? "graphics variant" : "graphics", pso_t0, state, vr);
+    vkd3d_bench_pso_event(key ? "graphics variant" : library_flags ? "graphics library" : "graphics", pso_t0, state, vr);
+    if (!key && !library_flags)
+    {
+        state->bench_created_ns = vkd3d_get_current_time_ns();
+        state->bench_compile_us = (state->bench_created_ns - pso_t0) / 1000;
+    }
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {

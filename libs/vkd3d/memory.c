@@ -1025,6 +1025,9 @@ static bool vkd3d_bench_vram_reserve_refuses(struct d3d12_device *device, uint32
     return true;
 }
 
+/* miles-bench: what the allocation on this thread is for, for the slow-allocation trace event. */
+static __thread const struct vkd3d_allocate_memory_info *vkd3d_bench_alloc_info;
+
 static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, const uint32_t base_type_mask,
         void *pNext, bool respect_budget, VkDeviceSize vram_reserve, struct vkd3d_device_memory_allocation *allocation)
@@ -1164,8 +1167,14 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
     alloc_ns = vkd3d_get_current_time_ns() - alloc_t0;
     /* miles-bench: slow or failed driver allocations, on the frame trace's clock. */
     if (vr != VK_SUCCESS || alloc_ns > 2000000)
-        vkd3d_frametrace_event("vkAllocateMemory %s %.3f ms %"PRIu64" KiB type %u flags %#x", vr == VK_SUCCESS ? "ok" : "fail",
-                alloc_ns / 1e6, (uint64_t)allocate_info.allocationSize >> 10, allocate_info.memoryTypeIndex, type_flags);
+        vkd3d_frametrace_event("vkAllocateMemory %s %.3f ms %"PRIu64" KiB type %u flags %#x for %s heap %u hflags %#x aflags %#x",
+                vr == VK_SUCCESS ? "ok" : "fail", alloc_ns / 1e6, (uint64_t)allocate_info.allocationSize >> 10,
+                allocate_info.memoryTypeIndex, type_flags,
+                !vkd3d_bench_alloc_info ? "internal" : (vkd3d_bench_alloc_info->flags & VKD3D_ALLOCATION_FLAG_DEDICATED) ?
+                        "dedicated" : vkd3d_bench_alloc_info->pNext ? "pnext" : "plain",
+                vkd3d_bench_alloc_info ? vkd3d_bench_alloc_info->heap_properties.Type : 0,
+                vkd3d_bench_alloc_info ? vkd3d_bench_alloc_info->heap_flags : 0,
+                vkd3d_bench_alloc_info ? vkd3d_bench_alloc_info->flags : 0);
     vkd3d_memtrace_vk_allocate(device, allocate_info.memoryTypeIndex, allocate_info.allocationSize,
             vr == VK_SUCCESS, respect_budget, vr == VK_SUCCESS ? allocation->vk_memory : VK_NULL_HANDLE);
 
@@ -1510,7 +1519,22 @@ static bool vkd3d_is_imported_allocation(const struct vkd3d_allocate_memory_info
     return false;
 }
 
+static HRESULT vkd3d_memory_allocation_init_impl(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,
+        struct vkd3d_memory_allocator *allocator, const struct vkd3d_allocate_memory_info *info);
+
 static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,
+        struct vkd3d_memory_allocator *allocator, const struct vkd3d_allocate_memory_info *info)
+{
+    const struct vkd3d_allocate_memory_info *outer = vkd3d_bench_alloc_info;
+    HRESULT hr;
+
+    vkd3d_bench_alloc_info = info;
+    hr = vkd3d_memory_allocation_init_impl(allocation, device, allocator, info);
+    vkd3d_bench_alloc_info = outer;
+    return hr;
+}
+
+static HRESULT vkd3d_memory_allocation_init_impl(struct vkd3d_memory_allocation *allocation, struct d3d12_device *device,
         struct vkd3d_memory_allocator *allocator, const struct vkd3d_allocate_memory_info *info)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;

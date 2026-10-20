@@ -2825,6 +2825,8 @@ static void d3d12_command_allocator_free_resources(struct d3d12_command_allocato
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     unsigned int i;
 
+    vkd3d_index_cache_allocator_reset(allocator);
+
     for (i = 0; i < allocator->buffer_view_count; ++i)
     {
         VK_CALL(vkDestroyBufferView(device->vk_device, allocator->buffer_views[i], NULL));
@@ -2959,6 +2961,8 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
             d3d12_command_list_allocator_destroyed(allocator->current_command_list);
 
         d3d12_command_allocator_free_resources(allocator);
+        vkd3d_free(allocator->idxc_pins);
+        vkd3d_free(allocator->idxc_writes);
         vkd3d_free(allocator->buffer_views);
         vkd3d_free(allocator->views);
         vkd3d_free(allocator->pipelines);
@@ -11599,6 +11603,61 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
     d3d12_command_list_check_compute_barrier(list);
 }
 
+/* miles-bench: a GPU write at a VA that idxcache.c cannot mirror: if it lands in the geometry heap, the range
+ * (size 0: the rest of the resource, as for root UAVs) leaves the index cache for good. */
+static void d3d12_command_list_index_cache_exclude_va(struct d3d12_command_list *list, VkDeviceAddress va,
+        VkDeviceSize size, const char *what)
+{
+    const struct vkd3d_unique_resource *resource;
+
+    if (!va || !vkd3d_index_cache_va_is_source(va))
+        return;
+    if (!(resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, va)))
+    {
+        vkd3d_index_cache_disable(what);
+        return;
+    }
+    if (!size)
+        size = resource->size - (va - resource->va);
+    vkd3d_index_cache_exclude(resource->vk_buffer, va - resource->va, size, what);
+}
+
+/* miles-bench: the index cache keeps VRAM copies of the geometry heap (idxcache.c). After a copy into the
+ * heap was recorded, the same bytes go into every cached run over the range, right behind it, so draws
+ * bound to those runs see what the heap holds. */
+static void d3d12_command_list_index_cache_mirror(struct d3d12_command_list *list, struct d3d12_resource *dst_resource,
+        VkBuffer src_buffer, VkDeviceSize src_offset, VkDeviceSize dst_offset, VkDeviceSize size)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkCopyBufferInfo2 copy_info;
+    VkBufferCopy2 *regions;
+    VkBuffer cache_buffer;
+    size_t count;
+
+    if (!vkd3d_index_cache_is_source(dst_resource->res.vk_buffer))
+        return;
+    if (!list->allocator)
+    {
+        vkd3d_index_cache_disable("a copy into the geometry heap was recorded without an allocator");
+        return;
+    }
+    if ((count = vkd3d_index_cache_gpu_write(list->allocator, src_offset, dst_offset, size, &regions, &cache_buffer)))
+    {
+        /* One span for write-after-write tracking: the regions are ascending and disjoint, and a barrier
+         * injected between them would leave the earlier ones of this same copy untracked. */
+        d3d12_command_list_mark_copy_buffer_write(list, cache_buffer, regions[0].dstOffset,
+                regions[count - 1].dstOffset + regions[count - 1].size - regions[0].dstOffset, false);
+        copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2;
+        copy_info.pNext = NULL;
+        copy_info.srcBuffer = src_buffer;
+        copy_info.dstBuffer = cache_buffer;
+        copy_info.regionCount = count;
+        copy_info.pRegions = regions;
+        VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
+    }
+    vkd3d_free(regions);
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_list_iface *iface,
         ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 byte_count)
 {
@@ -11636,10 +11695,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
     }
     vkd3d_frametrace_ref_va(VKD3D_FRAMETRACE_REF_COPY_DST, dst_resource->res.va + dst_offset, byte_count);
 
-    /* idxcache.c only follows CPU writes into the geometry heap. */
-    if (vkd3d_index_cache_is_source(dst_resource->res.vk_buffer))
-        vkd3d_index_cache_disable("CopyBufferRegion writes the geometry heap");
-
     d3d12_command_list_track_resource_usage(list, dst_resource, true);
     d3d12_command_list_track_resource_usage(list, src_resource, true);
 
@@ -11672,6 +11727,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
     d3d12_command_list_mark_copy_buffer_write(list, copy_info.dstBuffer, buffer_copy.dstOffset, buffer_copy.size,
             !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
     VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
+
+    d3d12_command_list_index_cache_mirror(list, dst_resource, copy_info.srcBuffer, buffer_copy.srcOffset,
+            buffer_copy.dstOffset, byte_count);
 
     VKD3D_BREADCRUMB_COMMAND(COPY);
 }
@@ -12983,6 +13041,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
             iface, dst, dst_x, dst_y, dst_z, src, src_box);
 
+    if (dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+        vkd3d_index_cache_exclude(impl_from_ID3D12Resource(dst->pResource)->res.vk_buffer,
+                impl_from_ID3D12Resource(dst->pResource)->mem.offset + dst->PlacedFootprint.Offset,
+                (VkDeviceSize)dst->PlacedFootprint.Footprint.RowPitch * dst->PlacedFootprint.Footprint.Height *
+                dst->PlacedFootprint.Footprint.Depth, "CopyTextureRegion writes the geometry heap");
+
     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -13191,6 +13255,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
         d3d12_command_list_mark_copy_buffer_write(list, copy_info.dstBuffer, vk_buffer_copy.dstOffset, vk_buffer_copy.size,
                 !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
         VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
+        d3d12_command_list_index_cache_mirror(list, dst_resource, copy_info.srcBuffer, vk_buffer_copy.srcOffset,
+                vk_buffer_copy.dstOffset, vk_buffer_copy.size);
     }
     else
     {
@@ -14790,6 +14856,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPipelineState(d3d12_command_
     unsigned int i;
 
     TRACE("iface %p, pipeline_state %p.\n", iface, pipeline_state);
+
+    /* miles-bench: how long after a slow compile the game first records with the PSO. */
+    if (state && state->bench_compile_us >= 10000 && !state->bench_bound &&
+            !InterlockedExchange(&state->bench_bound, 1))
+        vkd3d_frametrace_event("pso firstbind %.1f ms after create, compile %.1f ms, pso %016"PRIx64" tid %04x",
+                (vkd3d_get_current_time_ns() - state->bench_created_ns) / 1e6, state->bench_compile_us / 1e3,
+                vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat),
+                (unsigned int)GetCurrentThreadId());
 
     if ((TRACE_ON() || list->device->debug_ring.active) && state)
     {
@@ -16726,6 +16800,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetComputeRootUnorderedAccessVi
     TRACE("iface %p, root_parameter_index %u, address %#"PRIx64".\n",
             iface, root_parameter_index, address);
 
+    d3d12_command_list_index_cache_exclude_va(list, address, 0, "a root UAV points into the geometry heap");
+
     d3d12_command_list_set_root_descriptor(list, &list->compute_bindings,
             root_parameter_index, address);
 }
@@ -16737,6 +16813,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootUnorderedAccessV
 
     TRACE("iface %p, root_parameter_index %u, address %#"PRIx64".\n",
             iface, root_parameter_index, address);
+
+    d3d12_command_list_index_cache_exclude_va(list, address, 0, "a root UAV points into the geometry heap");
 
     d3d12_command_list_set_root_descriptor(list, &list->graphics_bindings,
             root_parameter_index, address);
@@ -16928,6 +17006,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_SOSetTargets(d3d12_command_list
     {
         if (views[i].BufferLocation && views[i].SizeInBytes)
         {
+            d3d12_command_list_index_cache_exclude_va(list, views[i].BufferLocation, views[i].SizeInBytes,
+                    "a stream output target is in the geometry heap");
+            d3d12_command_list_index_cache_exclude_va(list, views[i].BufferFilledSizeLocation, 4,
+                    "a stream output counter is in the geometry heap");
             resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, views[i].BufferLocation);
             if (resource)
             {
@@ -18303,6 +18385,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
 
     metadata = d3d12_desc_decode_metadata(list->device, cpu_handle.ptr);
     resource_impl = impl_from_ID3D12Resource(resource);
+    if (resource_impl && d3d12_resource_is_buffer(resource_impl))
+        vkd3d_index_cache_exclude(resource_impl->res.vk_buffer, resource_impl->mem.offset, resource_impl->desc.Width,
+                "a UAV clear writes the geometry heap");
 
     if (!resource_impl || !metadata.view)
         return;
@@ -18463,6 +18548,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
 
     metadata = d3d12_desc_decode_metadata(list->device, cpu_handle.ptr);
     resource_impl = impl_from_ID3D12Resource(resource);
+    if (resource_impl && d3d12_resource_is_buffer(resource_impl))
+        vkd3d_index_cache_exclude(resource_impl->res.vk_buffer, resource_impl->mem.offset, resource_impl->desc.Width,
+                "a UAV clear writes the geometry heap");
 
     if (!resource_impl || !metadata.view)
         return;
@@ -19092,6 +19180,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveQueryData(d3d12_command_
     if (!query_count)
         return;
 
+    if (d3d12_resource_is_buffer(buffer))
+        vkd3d_index_cache_exclude(buffer->res.vk_buffer, buffer->mem.offset + aligned_dst_buffer_offset,
+                (VkDeviceSize)query_count * d3d12_query_heap_type_get_data_size(query_heap->desc.Type),
+                "ResolveQueryData writes the geometry heap");
     if (!d3d12_resource_is_buffer(buffer))
     {
         WARN("Destination resource is not a buffer.\n");
@@ -21518,6 +21610,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_WriteBufferImmediate(d3d12_comm
 
     for (i = 0; i < count; ++i)
     {
+        d3d12_command_list_index_cache_exclude_va(list, parameters[i].Dest, 4, "WriteBufferImmediate writes the geometry heap");
         if (!(resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, parameters[i].Dest)))
         {
             d3d12_command_list_mark_as_invalid(list, "Invalid target address %p.\n", parameters[i].Dest);

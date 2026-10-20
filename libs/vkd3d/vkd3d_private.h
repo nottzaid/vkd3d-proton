@@ -1077,6 +1077,12 @@ bool vkd3d_index_cache_take_stats(uint64_t *hits, uint64_t *misses, uint64_t *fu
         uint64_t *scan_steps);
 void vkd3d_index_cache_invalidate_cpu(const void *address, uint64_t size);
 void vkd3d_index_cache_disable(const char *why);
+bool vkd3d_index_cache_va_is_source(VkDeviceAddress va);
+void vkd3d_index_cache_exclude(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const char *what);
+struct d3d12_command_allocator;
+size_t vkd3d_index_cache_gpu_write(struct d3d12_command_allocator *allocator, VkDeviceSize src_offset,
+        VkDeviceSize offset, VkDeviceSize size, VkBufferCopy2 **regions, VkBuffer *cache_buffer);
+void vkd3d_index_cache_allocator_reset(struct d3d12_command_allocator *allocator);
 
 struct vkd3d_memory_allocator
 {
@@ -2551,6 +2557,12 @@ struct d3d12_pipeline_state
     bool pso_is_loaded_from_cached_blob;
     bool pso_is_fully_dynamic;
 
+    /* miles-bench: when the main pipeline finished compiling and how long it took, for the
+     * create-to-first-bind gap of slow compiles (frametrace "pso firstbind"). */
+    uint64_t bench_created_ns;
+    uint32_t bench_compile_us;
+    LONG bench_bound;
+
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
 
@@ -2919,6 +2931,11 @@ struct d3d12_command_allocator
     VkCommandPool particle_pool;
     VkCommandBuffer *particle_cbs;
     size_t particle_cbs_size, particle_cb_count, particle_cb_used;
+    /* miles-bench: index cache runs this allocator's lists mirror GPU writes into (idxcache.c). */
+    uint32_t *idxc_pins;
+    size_t idxc_pins_size, idxc_pin_count;
+    struct { uint32_t epoch, first, last; } *idxc_writes; /* source pages its copies wrote */
+    size_t idxc_writes_size, idxc_write_count;
     struct d3d12_command_allocator_scratch_pool scratch_pools[VKD3D_SCRATCH_POOL_KIND_COUNT];
 
     VkExtent3D transfer_granularity;

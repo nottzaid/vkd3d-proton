@@ -22,8 +22,17 @@
  * (enginepatch.c hooks every writer and reports each written range after the write, plus every new
  * allocation). Each write stamps its source pages with a new generation; a cached run carries the
  * generation it was copied at and serves a draw only if none of the draw's pages were written
- * since. A GPU write into the heap (never seen: the ManagedBuffer is filled by CPU stores) turns the
- * cache off for good.
+ * since.
+ *
+ * GPU writes into the heap (CopyBufferRegion; in the open world, a few minutes in): draws already
+ * recorded against a cached run may run after the copy (a list recorded earlier, submitted later), so
+ * every live run over the written range gets the same bytes copied into it right after the app's copy,
+ * in the same command buffer: the cached copy changes at the same point of GPU order as the heap,
+ * under the app's own barriers (buffer barriers are global memory barriers here). The written pages
+ * then stay out of the cache until the GPU is done with the copy, which D3D12 guarantees once the
+ * allocator holding it is reset (or destroyed): a run created earlier would be filled on the transfer
+ * queue, which does not wait for the app's copy. Meanwhile draws over them bind the heap itself, as stock
+ * does. The mirrored runs stay pinned until then too.
  */
 
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
@@ -37,6 +46,7 @@ static unsigned int idxc_page_shift = 12;
 static VkDeviceSize idxc_size = 64ull << 20;
 #define IDXC_MIN_SOURCE (256ull << 20)
 #define IDXC_REUSE_FRAMES 8
+#define IDXC_EXCLUDED 0x80000000u
 
 struct idxc_entry
 {
@@ -76,14 +86,20 @@ static struct
     uint64_t *run_last;
     struct idxc_entry *table;
     uint32_t *page_gen;  /* per source page: generation of the last write */
+    uint32_t *page_gpu;  /* per source page: GPU writes recorded and not known to be done (allocator not reset),
+                          * plus IDXC_EXCLUDED once a write the cache cannot follow may reach it */
+    uint32_t epoch;      /* source heap registrations, so page ranges of an earlier heap are never released */
+    uint64_t gpu_writes, gpu_pages, gpu_mirrored, gpu_bypassed;
     uint32_t *run_gen;   /* per cache page, at a run's first page: generation it was copied at */
     uint32_t gen;
     const uint8_t *src_cpu;
+    VkDeviceAddress src_va;
     bool disabled;
     struct idxc_copy *pending;
     size_t pending_count, pending_size;
     uint64_t hits, misses, full, bytes, stale, invalidations, verified, mismatched;
     uint64_t *run_copied; /* per cache page, at a run's first page: present count of the copy */
+    uint32_t *run_pins;   /* per cache page, at a run's first page: allocators holding a mirror into it */
     uint64_t submit_checks;
     /* The present count of the last failed allocation and the smallest run size that failed in it:
      * within one present nothing becomes evictable (run_last only grows), so any run at least that
@@ -188,7 +204,8 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
                 !(idxc.run_owner = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_owner))) ||
                 !(idxc.run_last = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_last))) ||
                 !(idxc.run_gen = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_gen))) ||
-                !(idxc.run_copied = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_copied))))
+                !(idxc.run_copied = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_copied))) ||
+                !(idxc.run_pins = vkd3d_calloc(idxc.cache_pages, sizeof(*idxc.run_pins))))
         {
             rwlock_unlock_write(&idxc_lock);
             return;
@@ -199,7 +216,8 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
 
     src_pages = (size_t)((heap->desc.SizeInBytes + (1u << idxc_page_shift) - 1) >> idxc_page_shift);
     if (!(idxc.table = vkd3d_calloc(src_pages, sizeof(*idxc.table))) ||
-            !(idxc.page_gen = vkd3d_calloc(src_pages, sizeof(*idxc.page_gen))))
+            !(idxc.page_gen = vkd3d_calloc(src_pages, sizeof(*idxc.page_gen))) ||
+            !(idxc.page_gpu = vkd3d_calloc(src_pages, sizeof(*idxc.page_gpu))))
     {
         rwlock_unlock_write(&idxc_lock);
         return;
@@ -209,6 +227,9 @@ void vkd3d_index_cache_register(struct d3d12_device *device, struct d3d12_heap *
     idxc.src_offset = heap->allocation.offset;
     idxc.src_size = heap->desc.SizeInBytes;
     idxc.src_cpu = heap->allocation.cpu_address;
+    idxc.src_va = heap->allocation.resource.va;
+    idxc.epoch++;
+    idxc.gpu_pages = 0;
     idxc.gen = 1;
     idxc.cache_head = 0;
     rwlock_unlock_write(&idxc_lock);
@@ -227,7 +248,10 @@ void vkd3d_index_cache_unregister(struct d3d12_heap *heap)
         idxc.table = NULL;
         vkd3d_free(idxc.page_gen);
         idxc.page_gen = NULL;
+        vkd3d_free(idxc.page_gpu);
+        idxc.page_gpu = NULL;
         idxc.src_cpu = NULL;
+        idxc.src_va = 0;
         idxc.heap = NULL;
         idxc.src_buffer = VK_NULL_HANDLE;
         idxc.pending_count = 0;
@@ -238,6 +262,66 @@ void vkd3d_index_cache_unregister(struct d3d12_heap *heap)
 bool vkd3d_index_cache_is_source(VkBuffer buffer)
 {
     return buffer && buffer == idxc.src_buffer;
+}
+
+bool vkd3d_index_cache_va_is_source(VkDeviceAddress va)
+{
+    return idxc.src_va && va >= idxc.src_va && va - idxc.src_va < idxc.src_size;
+}
+
+/* [offset, offset + size) of `buffer` may be written by the GPU in a way the cache cannot mirror (a UAV over it,
+ * a clear, a query resolve): if it is the source, those pages leave the cache for good. Draws already
+ * recorded against runs over them are not covered, so the log says how many live runs overlap (0: none). */
+void vkd3d_index_cache_exclude(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const char *what)
+{
+    uint32_t first, last, i, end, g, overlap = 0, newly = 0;
+    VkDeviceSize rel, run_lo;
+
+    if (!size || !vkd3d_index_cache_is_source(buffer))
+        return;
+    rwlock_lock_write(&idxc_lock);
+    if (!idxc.page_gpu || offset < idxc.src_offset || offset - idxc.src_offset >= idxc.src_size)
+    {
+        rwlock_unlock_write(&idxc_lock);
+        return;
+    }
+    rel = offset - idxc.src_offset;
+    size = min(size, idxc.src_size - rel);
+    first = (uint32_t)(rel >> idxc_page_shift);
+    last = (uint32_t)((rel + size - 1) >> idxc_page_shift);
+    for (i = first; i <= last; i++)
+        newly += !(idxc.page_gpu[i] & IDXC_EXCLUDED);
+    if (!newly)
+    {
+        rwlock_unlock_write(&idxc_lock);
+        return;
+    }
+    for (i = 0; i < idxc.cache_pages; i = end)
+    {
+        end = i + 1;
+        if (idxc.run_of[i] != (int32_t)i)
+            continue;
+        while (end < idxc.cache_pages && idxc.run_of[end] == (int32_t)i)
+            end++;
+        run_lo = (VkDeviceSize)idxc.run_owner[i] << idxc_page_shift;
+        if (run_lo < rel + size && run_lo + ((VkDeviceSize)(end - i) << idxc_page_shift) > rel)
+            overlap++;
+    }
+    g = ++idxc.gen;
+    for (i = first; i <= last; i++)
+    {
+        idxc.page_gen[i] = g;
+        if (!idxc.page_gpu[i])
+            idxc.gpu_pages++;
+        idxc.page_gpu[i] |= IDXC_EXCLUDED;
+    }
+    rwlock_unlock_write(&idxc_lock);
+    if (overlap)
+        ERR("idxcache: %s: %"PRIu64" bytes at heap offset %#"PRIx64" leave the cache (%u live runs overlapped).\n",
+                what, (uint64_t)size, (uint64_t)rel, overlap);
+    else
+        INFO("idxcache: %s: %"PRIu64" bytes at heap offset %#"PRIx64" leave the cache (no live run overlapped).\n",
+                what, (uint64_t)size, (uint64_t)rel);
 }
 
 /* The CPU finished writing [address, address + size) (enginepatch.c, after each geometry write). */
@@ -271,6 +355,135 @@ void vkd3d_index_cache_disable(const char *why)
         idxc.disabled = true;
         ERR("idxcache: %s, turning the index cache off.\n", why);
     }
+}
+
+/* The GPU writes [offset, offset + size) of the source buffer: a CopyBufferRegion just recorded into a
+ * command buffer of `allocator`, from src_offset of its source buffer. Returns the regions to copy right
+ * after it from the same source buffer into *cache_buffer: one per live run over the written range.
+ * Those runs stay pinned (never evicted) until the allocator is reset or destroyed: the mirror lands
+ * whenever the list runs, which D3D12 only bounds by the allocator's reset. The caller frees *regions. */
+size_t vkd3d_index_cache_gpu_write(struct d3d12_command_allocator *allocator, VkDeviceSize src_offset,
+        VkDeviceSize offset, VkDeviceSize size, VkBufferCopy2 **regions, VkBuffer *cache_buffer)
+{
+    VkDeviceSize rel, run_lo, run_hi, lo, hi;
+    uint32_t first, last, i, end, g;
+    size_t count = 0, capacity = 0;
+    VkBufferCopy2 *r;
+
+    *regions = NULL;
+    *cache_buffer = VK_NULL_HANDLE;
+    if (!size)
+        return 0;
+    rwlock_lock_write(&idxc_lock);
+    /* Mirrors go on after the cache was turned off: draws recorded before still bind its runs. */
+    if (!idxc.page_gpu || offset < idxc.src_offset || offset - idxc.src_offset >= idxc.src_size)
+    {
+        rwlock_unlock_write(&idxc_lock);
+        return 0;
+    }
+    rel = offset - idxc.src_offset;
+    size = min(size, idxc.src_size - rel);
+    first = (uint32_t)(rel >> idxc_page_shift);
+    last = (uint32_t)((rel + size - 1) >> idxc_page_shift);
+
+    /* Every run over the range, drawn recently or not: a list recorded long ago may still be submitted
+     * (run_last is only a hint for eviction). Runs replaced in the table count too: recorded draws may
+     * still bind them. */
+    for (i = 0; i < idxc.cache_pages; i = end)
+    {
+        end = i + 1;
+        if (idxc.run_of[i] != (int32_t)i)
+            continue;
+        while (end < idxc.cache_pages && idxc.run_of[end] == (int32_t)i)
+            end++;
+        run_lo = (VkDeviceSize)idxc.run_owner[i] << idxc_page_shift;
+        run_hi = min(run_lo + ((VkDeviceSize)(end - i) << idxc_page_shift), idxc.src_size);
+        lo = max(run_lo, rel);
+        hi = min(run_hi, rel + size);
+        if (lo >= hi)
+            continue;
+        if (!vkd3d_array_reserve((void **)regions, &capacity, count + 1, sizeof(**regions)) ||
+                !vkd3d_array_reserve((void **)&allocator->idxc_pins, &allocator->idxc_pins_size,
+                allocator->idxc_pin_count + 1, sizeof(*allocator->idxc_pins)))
+        {
+            /* Draws already recorded against this run would read stale bytes; nothing to do but stop. */
+            idxc.disabled = true;
+            rwlock_unlock_write(&idxc_lock);
+            ERR("idxcache: out of memory mirroring a GPU write, turning the index cache off.\n");
+            *cache_buffer = idxc.cache.resource.vk_buffer;
+            return count;
+        }
+        r = &(*regions)[count++];
+        memset(r, 0, sizeof(*r));
+        r->sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2;
+        r->srcOffset = src_offset + (lo - rel);
+        r->dstOffset = idxc.cache.offset + ((VkDeviceSize)i << idxc_page_shift) + (lo - run_lo);
+        r->size = hi - lo;
+        idxc.run_pins[i]++;
+        allocator->idxc_pins[allocator->idxc_pin_count++] = i;
+    }
+    g = ++idxc.gen;
+    for (i = first; i <= last; i++)
+    {
+        idxc.page_gen[i] = g;
+        if (!idxc.page_gpu[i]++)
+            idxc.gpu_pages++;
+    }
+    if (vkd3d_array_reserve((void **)&allocator->idxc_writes, &allocator->idxc_writes_size,
+            allocator->idxc_write_count + 1, sizeof(*allocator->idxc_writes)))
+    {
+        allocator->idxc_writes[allocator->idxc_write_count].epoch = idxc.epoch;
+        allocator->idxc_writes[allocator->idxc_write_count].first = first;
+        allocator->idxc_writes[allocator->idxc_write_count++].last = last;
+    }
+    else
+    {
+        /* Never released: the pages stay out of the cache. */
+        ERR("idxcache: out of memory recording a GPU write; its pages stay out of the cache.\n");
+    }
+    idxc.gpu_mirrored += count;
+    if (idxc.gpu_writes++ < 16 || !(idxc.gpu_writes & (idxc.gpu_writes - 1)))
+        INFO("idxcache: GPU write of %"PRIu64" bytes at heap offset %#"PRIx64" (%zu runs mirrored); %"PRIu64
+                " GPU writes, %"PRIu64" runs mirrored, %"PRIu64" pages pending, %"PRIu64" draws bypassed "
+                "so far.\n", (uint64_t)size, (uint64_t)rel, count, idxc.gpu_writes, idxc.gpu_mirrored, idxc.gpu_pages,
+                __atomic_load_n(&idxc.gpu_bypassed, __ATOMIC_RELAXED));
+    *cache_buffer = idxc.cache.resource.vk_buffer;
+    rwlock_unlock_write(&idxc_lock);
+    vkd3d_frametrace_event("idxcache gpu write %"PRIu64" bytes at %#"PRIx64" %zu mirrored", (uint64_t)size,
+            (uint64_t)rel, count);
+    return count;
+}
+
+/* The allocator was reset or destroyed: the GPU is done with its lists, the app's copies and their mirrors
+ * included. The pages they wrote can be cached again, from what the heap now holds. */
+void vkd3d_index_cache_allocator_reset(struct d3d12_command_allocator *allocator)
+{
+    uint32_t i, g = 0;
+    size_t j;
+
+    if (!allocator->idxc_pin_count && !allocator->idxc_write_count)
+        return;
+    rwlock_lock_write(&idxc_lock);
+    for (j = 0; j < allocator->idxc_pin_count; j++)
+        idxc.run_pins[allocator->idxc_pins[j]]--;
+    if (allocator->idxc_write_count)
+        g = ++idxc.gen;
+    for (j = 0; j < allocator->idxc_write_count; j++)
+    {
+        if (!idxc.page_gpu || allocator->idxc_writes[j].epoch != idxc.epoch)
+            continue;
+        for (i = allocator->idxc_writes[j].first; i <= allocator->idxc_writes[j].last; i++)
+        {
+            if (!--idxc.page_gpu[i])
+            {
+                idxc.gpu_pages--;
+                idxc.page_gen[i] = g;
+            }
+        }
+    }
+    rwlock_unlock_write(&idxc_lock);
+    allocator->idxc_pin_count = 0;
+    allocator->idxc_write_count = 0;
 }
 
 /* Find `pages` contiguous cache pages for a new run, evicting runs not drawn recently. Returns the
@@ -307,7 +520,7 @@ static int32_t idxc_alloc_locked(uint32_t pages)
         /* A recently drawn run in the way: step past it and keep looking. */
         for (i = head; i < head + pages; i++)
         {
-            if ((run = idxc.run_of[i]) >= 0 && idxc.run_last[run] + IDXC_REUSE_FRAMES > frame)
+            if ((run = idxc.run_of[i]) >= 0 && (idxc.run_last[run] + IDXC_REUSE_FRAMES > frame || idxc.run_pins[run]))
                 break;
         }
         if (i < head + pages)
@@ -346,7 +559,7 @@ static int32_t idxc_alloc_locked(uint32_t pages)
         for (i = 0; i < idxc.cache_pages; i++)
         {
             run = idxc.run_of[i];
-            if (run >= 0 && idxc.run_last[run] + IDXC_REUSE_FRAMES > frame)
+            if (run >= 0 && (idxc.run_last[run] + IDXC_REUSE_FRAMES > frame || idxc.run_pins[run]))
                 gap = 0;
             else if (++gap > best)
                 best = gap;
@@ -390,6 +603,19 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
             rel = offset - idxc.src_offset;
             p0 = rel >> idxc_page_shift;
             pages = ((rel + size - 1) >> idxc_page_shift) - p0 + 1;
+            /* Pages the GPU wrote: bind the heap itself, without the exclusive lock. */
+            if (idxc.gpu_pages)
+            {
+                for (i = 0; i < pages; i++)
+                {
+                    if (idxc.page_gpu[p0 + i])
+                    {
+                        __atomic_add_fetch(&idxc.gpu_bypassed, 1, __ATOMIC_RELAXED);
+                        rwlock_unlock_read(&idxc_lock);
+                        return false;
+                    }
+                }
+            }
             e = &idxc.table[p0];
             if ((slot = e->slot) && e->pages >= pages)
             {
@@ -438,6 +664,22 @@ bool vkd3d_index_cache_lookup(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize
     p0 = rel >> idxc_page_shift;
     pages = ((end - 1) >> idxc_page_shift) - p0 + 1;
     e = &idxc.table[p0];
+
+    /* Pages the GPU wrote: the draw binds the heap itself. */
+    if (idxc.gpu_pages)
+    {
+        uint32_t i;
+
+        for (i = 0; i < pages; i++)
+        {
+            if (idxc.page_gpu[p0 + i])
+            {
+                __atomic_add_fetch(&idxc.gpu_bypassed, 1, __ATOMIC_RELAXED);
+                rwlock_unlock_write(&idxc_lock);
+                return false;
+            }
+        }
+    }
 
     if (e->slot && e->pages >= pages)
     {

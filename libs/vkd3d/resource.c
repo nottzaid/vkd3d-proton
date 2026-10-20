@@ -8276,6 +8276,13 @@ void d3d12_desc_create_uav_heap(vkd3d_cpu_descriptor_va_t desc_va, struct d3d12_
     if (counter_resource && (!resource || !is_buffer))
         FIXME("Ignoring counter resource %p.\n", counter_resource);
 
+    /* miles-bench: a UAV can write the geometry heap; its range leaves the index cache for good. */
+    if (is_buffer && resource)
+        vkd3d_index_cache_exclude(resource->res.vk_buffer, resource->mem.offset, resource->desc.Width,
+                "a UAV views the geometry heap");
+    if (counter_resource && d3d12_resource_is_buffer(counter_resource))
+        vkd3d_index_cache_exclude(counter_resource->res.vk_buffer, counter_resource->mem.offset,
+                counter_resource->desc.Width, "a UAV counter is in the geometry heap");
     if (is_buffer)
         vkd3d_create_buffer_uav_heap(desc_va, device, resource, counter_resource, desc);
     else
@@ -8306,6 +8313,13 @@ void d3d12_desc_create_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va, struct d3
     if (counter_resource && (!resource || !is_buffer))
         FIXME("Ignoring counter resource %p.\n", counter_resource);
 
+    /* miles-bench: a UAV can write the geometry heap; its range leaves the index cache for good. */
+    if (is_buffer && resource)
+        vkd3d_index_cache_exclude(resource->res.vk_buffer, resource->mem.offset, resource->desc.Width,
+                "a UAV views the geometry heap");
+    if (counter_resource && d3d12_resource_is_buffer(counter_resource))
+        vkd3d_index_cache_exclude(counter_resource->res.vk_buffer, counter_resource->mem.offset,
+                counter_resource->desc.Width, "a UAV counter is in the geometry heap");
     if (is_buffer)
         vkd3d_create_buffer_uav_embedded(desc_va, device, resource, counter_resource, desc);
     else
@@ -8336,6 +8350,13 @@ void d3d12_desc_create_uav(vkd3d_cpu_descriptor_va_t desc_va, struct d3d12_devic
     if (counter_resource && (!resource || !is_buffer))
         FIXME("Ignoring counter resource %p.\n", counter_resource);
 
+    /* miles-bench: a UAV can write the geometry heap; its range leaves the index cache for good. */
+    if (is_buffer && resource)
+        vkd3d_index_cache_exclude(resource->res.vk_buffer, resource->mem.offset, resource->desc.Width,
+                "a UAV views the geometry heap");
+    if (counter_resource && d3d12_resource_is_buffer(counter_resource))
+        vkd3d_index_cache_exclude(counter_resource->res.vk_buffer, counter_resource->mem.offset,
+                counter_resource->desc.Width, "a UAV counter is in the geometry heap");
     if (is_buffer)
         vkd3d_create_buffer_uav(desc_va, device, resource, counter_resource, desc);
     else
