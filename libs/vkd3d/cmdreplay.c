@@ -69,11 +69,12 @@ struct rp_cb
 #define RP_HANDLE(c) ((VkCommandBuffer)((uintptr_t)(c) | 1))
 
 #define RP_CHUNK_SIZE (64u << 10)
+#define RP_FREE_MAX 64 /* chunks kept for reuse */
 /* A chunk is published once it holds this many ops (at the next op): the worker replays a long
  * command buffer while it is still being recorded. */
 #define RP_PUBLISH_OPS 96
 /* Pause loops before sleeping: the worker between chunks, waiters for the worker. */
-#define RP_WORKER_SPIN 20000
+#define RP_WORKER_SPIN 8000
 #define RP_WAIT_SPIN 4000
 
 static struct vkd3d_vk_device_procs rp_real;
@@ -84,6 +85,7 @@ static struct
     pthread_mutex_t lock;
     pthread_cond_t work_cond, done_cond;
     struct rp_chunk *head, *tail, *free;
+    unsigned int free_count;
     uint64_t published; /* written under lock */
     uint64_t done;      /* last chunk replayed */
     LONG waiters;
@@ -116,16 +118,19 @@ static uint64_t rp_now_us(void)
     return (uint64_t)(t.QuadPart * 1000000.0 / f.QuadPart);
 }
 
-static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size)
+static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size, bool exact)
 {
     struct rp_chunk *k = NULL;
-    uint32_t cap = max(RP_CHUNK_SIZE, min_size);
+    uint32_t cap = exact ? min_size : max(RP_CHUNK_SIZE, min_size);
 
     if (cap == RP_CHUNK_SIZE)
     {
         pthread_mutex_lock(&rp.lock);
         if ((k = rp.free))
+        {
             rp.free = k->next;
+            rp.free_count--;
+        }
         pthread_mutex_unlock(&rp.lock);
     }
     if (!k && !(k = vkd3d_malloc(sizeof(*k) + cap)))
@@ -147,9 +152,15 @@ static void rp_chunk_put(struct rp_chunk *k)
         return;
     }
     pthread_mutex_lock(&rp.lock);
-    k->next = rp.free;
-    rp.free = k;
+    if (rp.free_count < RP_FREE_MAX)
+    {
+        k->next = rp.free;
+        rp.free = k;
+        rp.free_count++;
+        k = NULL;
+    }
     pthread_mutex_unlock(&rp.lock);
+    vkd3d_free(k);
 }
 
 static uint64_t rp_publish_chunk(struct rp_chunk *k)
@@ -199,7 +210,7 @@ static struct rp_chunk *rp_defer_chunk(void (*replay)(VkCommandBuffer, const str
     if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE))
         return NULL;
     size = align(size, 16);
-    if (!(k = rp_chunk_get(VK_NULL_HANDLE, size)))
+    if (!(k = rp_chunk_get(VK_NULL_HANDLE, size, true)))
         return NULL;
     op = (struct rp_op *)k->data;
     op->replay = replay;
@@ -262,7 +273,7 @@ static void *rp_op_alloc(struct rp_cb *c, void (*replay)(VkCommandBuffer, const 
         rp_publish(c);
         k = NULL;
     }
-    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, size)))
+    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, size, false)))
     {
         ERR("cmdreplay: out of memory.\n");
         abort();
@@ -469,6 +480,8 @@ void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool)
     pthread_mutex_unlock(&rp.pool_lock);
 }
 
+static void rp_pool_unlink(struct rp_pool *pool, struct rp_cb *c);
+
 static VKAPI_ATTR VkResult VKAPI_CALL rp_vkAllocateCommandBuffers(VkDevice device,
         const VkCommandBufferAllocateInfo *info, VkCommandBuffer *cbs)
 {
@@ -493,7 +506,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkAllocateCommandBuffers(VkDevice devic
             for (j = 0; j < i; j++)
             {
                 c = RP_CB(cbs[j]);
-                pool->cbs = c->pool_next;
+                rp_pool_unlink(pool, c);
                 cbs[j] = c->vk_cb;
                 vkd3d_free(c);
             }
@@ -597,6 +610,13 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyCommandPool(VkDevice device, VkCom
         }
         vkd3d_free(pool);
     }
+}
+
+static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *allocator)
+{
+    /* Queued destroys run before the device goes. */
+    rp_guard();
+    rp_real.vkDestroyDevice(device, allocator);
 }
 
 /* Submission */
@@ -1217,6 +1237,48 @@ static void rp_replay_push_descriptors(VkCommandBuffer cb, const struct rp_op *h
     rp_real.vkCmdPushDescriptorSetKHR(cb, op->bind_point, op->layout, op->set, op->count, op->writes);
 }
 
+/* The array a write's descriptorType reads; the others may be left pointing anywhere. */
+static const VkDescriptorImageInfo *rp_write_images(const VkWriteDescriptorSet *w)
+{
+    switch (w->descriptorType)
+    {
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+            return w->pImageInfo;
+        default:
+            return NULL;
+    }
+}
+
+static const VkDescriptorBufferInfo *rp_write_buffers(const VkWriteDescriptorSet *w)
+{
+    switch (w->descriptorType)
+    {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+            return w->pBufferInfo;
+        default:
+            return NULL;
+    }
+}
+
+static const VkBufferView *rp_write_texels(const VkWriteDescriptorSet *w)
+{
+    switch (w->descriptorType)
+    {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            return w->pTexelBufferView;
+        default:
+            return NULL;
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
         VkPipelineBindPoint bind_point, VkPipelineLayout layout, uint32_t set, uint32_t count,
         const VkWriteDescriptorSet *writes)
@@ -1241,9 +1303,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
                     count, writes);
             return;
         }
-        size += RP_ARRAY_SIZE(writes[i].pImageInfo, writes[i].descriptorCount)
-                + RP_ARRAY_SIZE(writes[i].pBufferInfo, writes[i].descriptorCount)
-                + RP_ARRAY_SIZE(writes[i].pTexelBufferView, writes[i].descriptorCount);
+        size += RP_ARRAY_SIZE(rp_write_images(&writes[i]), writes[i].descriptorCount)
+                + RP_ARRAY_SIZE(rp_write_buffers(&writes[i]), writes[i].descriptorCount)
+                + RP_ARRAY_SIZE(rp_write_texels(&writes[i]), writes[i].descriptorCount);
     }
     op = rp_op_alloc(c, rp_replay_push_descriptors, sizeof(*op) + count * sizeof(*writes) + 16 + size);
     op->bind_point = bind_point;
@@ -1255,9 +1317,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
     payload += (uintptr_t)-(uintptr_t)payload & 15;
     for (i = 0; i < count; i++)
     {
-        RP_ARRAY(op->writes[i].pImageInfo, writes[i].pImageInfo, writes[i].descriptorCount);
-        RP_ARRAY(op->writes[i].pBufferInfo, writes[i].pBufferInfo, writes[i].descriptorCount);
-        RP_ARRAY(op->writes[i].pTexelBufferView, writes[i].pTexelBufferView, writes[i].descriptorCount);
+        RP_ARRAY(op->writes[i].pImageInfo, rp_write_images(&writes[i]), writes[i].descriptorCount);
+        RP_ARRAY(op->writes[i].pBufferInfo, rp_write_buffers(&writes[i]), writes[i].descriptorCount);
+        RP_ARRAY(op->writes[i].pTexelBufferView, rp_write_texels(&writes[i]), writes[i].descriptorCount);
     }
 }
 
@@ -1385,7 +1447,30 @@ void vkd3d_cmd_replay_install(struct d3d12_device *device)
         }
         INFO("cmdreplay: command lists record through the replay worker.\n");
     }
+    else
+    {
+        /* Another device (games create a throwaway one first): fill what the first one lacked. The
+         * winevulkan entry points are the same functions for every device. */
+        const PFN_vkVoidFunction *src = (const PFN_vkVoidFunction *)&device->vk_procs;
+        PFN_vkVoidFunction *dst = (PFN_vkVoidFunction *)&rp_real;
+        size_t i;
+
+        for (i = 0; i < sizeof(rp_real) / sizeof(*dst); i++)
+        {
+            if (!dst[i])
+                dst[i] = src[i];
+            else if (src[i] && src[i] != dst[i])
+                WARN("cmdreplay: device entry point %zu differs from the first device's.\n", i);
+        }
+    }
     rp_install_procs(&device->vk_procs);
+}
+
+/* For code outside vkd3d that records into a list's command buffer itself (interop): the worker
+ * replays everything recorded so far, then the caller gets the real handle. */
+VkCommandBuffer vkd3d_cmd_replay_direct_handle(VkCommandBuffer cb)
+{
+    return RP_TAGGED(cb) ? rp_drain_for_direct(RP_CB(cb), RP_HAND_EXEC) : cb;
 }
 
 bool vkd3d_cmd_replay_enabled(void)

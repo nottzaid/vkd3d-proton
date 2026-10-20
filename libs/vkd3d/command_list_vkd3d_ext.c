@@ -60,7 +60,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_GetVulkanHandle(d3
     if (!pVkCommandBuffer)
         return E_INVALIDARG;
 
-    *pVkCommandBuffer = command_list->cmd.vk_command_buffer;
+    /* miles-bench: outside code records into the real buffer directly (cmdreplay.c). */
+    *pVkCommandBuffer = vkd3d_cmd_replay_direct_handle(command_list->cmd.vk_command_buffer);
     /* TODO: Do we need to block any attempt to split command buffers here?
      * Might be a problem if DLSS implementation caches the VkCommandBuffer across DLSS invocations. */
     return S_OK;

@@ -1078,7 +1078,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_BeginVkCommandBufferI
     d3d12_command_list_decay_tracked_state(cmd_list);
     d3d12_command_list_invalidate_all_state(cmd_list);
 
-    *cmdBuf = cmd_list->cmd.vk_command_buffer;
+    /* miles-bench: outside code records into the real buffer directly (cmdreplay.c). */
+    *cmdBuf = vkd3d_cmd_replay_direct_handle(cmd_list->cmd.vk_command_buffer);
 
     return S_OK;
 }

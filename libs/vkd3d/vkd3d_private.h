@@ -7478,6 +7478,7 @@ void vkd3d_cmd_replay_install(struct d3d12_device *device);
 void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool);
 void vkd3d_cmd_replay_report(void);
 bool vkd3d_cmd_replay_enabled(void);
+VkCommandBuffer vkd3d_cmd_replay_direct_handle(VkCommandBuffer cb);
 void vkd3d_gputime_present(void);
 void vkd3d_gputime_note(VkCommandBuffer cmd, const char *fmt, ...);
 void vkd3d_gputime_ecl(VkCommandBuffer cmd);

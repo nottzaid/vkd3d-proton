@@ -1015,7 +1015,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyEvent(VkDevice device, VkEvent eve
 
 static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator)
 {
-    rp_guard();
+    if (fence)
+        rp_guard();
     rp_real.vkDestroyFence(device, fence, pAllocator);
 }
 
@@ -1145,7 +1146,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipeline(VkDevice device, VkPipeli
 
 static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyPipelineCache(VkDevice device, VkPipelineCache pipelineCache, const VkAllocationCallbacks* pAllocator)
 {
-    rp_guard();
+    if (pipelineCache)
+        rp_guard();
     rp_real.vkDestroyPipelineCache(device, pipelineCache, pAllocator);
 }
 
@@ -1244,7 +1246,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySampler(VkDevice device, VkSampler
 
 static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
 {
-    rp_guard();
+    if (semaphore)
+        rp_guard();
     rp_real.vkDestroySemaphore(device, semaphore, pAllocator);
 }
 
@@ -1281,44 +1284,15 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyShaderModule(VkDevice device, VkSh
 
 static VKAPI_ATTR VkResult VKAPI_CALL rp_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets)
 {
-    rp_guard();
+    if (descriptorPool)
+        rp_guard();
     return rp_real.vkFreeDescriptorSets(device, descriptorPool, descriptorSetCount, pDescriptorSets);
-}
-
-struct rp_op_vkFreeMemory
-{
-    struct rp_op h;
-    VkDevice device;
-    VkDeviceMemory memory;
-    const VkAllocationCallbacks *pAllocator;
-};
-
-static void rp_replay_vkFreeMemory(VkCommandBuffer cb, const struct rp_op *h)
-{
-    const struct rp_op_vkFreeMemory *op = (const void *)h;
-    rp_real.vkFreeMemory(op->device, op->memory, op->pAllocator);
-}
-
-static VKAPI_ATTR void VKAPI_CALL rp_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator)
-{
-    struct rp_op_vkFreeMemory *op;
-    struct rp_chunk *k;
-
-    if (!memory || !(k = rp_defer_chunk(rp_replay_vkFreeMemory, sizeof(*op))))
-    {
-        rp_real.vkFreeMemory(device, memory, pAllocator);
-        return;
-    }
-    op = (void *)k->data;
-    op->device = device;
-    op->memory = memory;
-    op->pAllocator = pAllocator;
-    rp_publish_chunk(k);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags)
 {
-    rp_guard();
+    if (descriptorPool)
+        rp_guard();
     return rp_real.vkResetDescriptorPool(device, descriptorPool, flags);
 }
 
@@ -1897,7 +1871,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdDrawMeshTasksIndirectCountEXT(VkComman
 
 static VKAPI_ATTR void VKAPI_CALL rp_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
 {
-    rp_guard();
+    if (swapchain)
+        rp_guard();
     rp_real.vkDestroySwapchainKHR(device, swapchain, pAllocator);
 }
 
@@ -2310,6 +2285,8 @@ static const char *const rp_drain_names[] =
 
 static void rp_install_procs(struct vkd3d_vk_device_procs *vk)
 {
+    if (vk->vkDestroyDevice)
+        vk->vkDestroyDevice = rp_vkDestroyDevice;
     if (vk->vkAllocateCommandBuffers)
         vk->vkAllocateCommandBuffers = rp_vkAllocateCommandBuffers;
     if (vk->vkBeginCommandBuffer)
@@ -2458,8 +2435,6 @@ static void rp_install_procs(struct vkd3d_vk_device_procs *vk)
         vk->vkFreeCommandBuffers = rp_vkFreeCommandBuffers;
     if (vk->vkFreeDescriptorSets)
         vk->vkFreeDescriptorSets = rp_vkFreeDescriptorSets;
-    if (vk->vkFreeMemory)
-        vk->vkFreeMemory = rp_vkFreeMemory;
     if (vk->vkQueueSubmit2)
         vk->vkQueueSubmit2 = rp_vkQueueSubmit2;
     if (vk->vkResetCommandBuffer)
