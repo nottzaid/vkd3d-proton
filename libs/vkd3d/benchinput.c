@@ -4,8 +4,10 @@
  *
  * VKD3D_BENCH_INPUT=1 starts a thread that polls /run/user/1000/vkd3d-input (inside the game's
  * container: /proc/<pid>/root/run/user/1000/vkd3d-input). Writing a key name there ("enter",
- * "escape", "space", "up", "down", "left", "right", "w", "a", "s", "d", "shift") delivers that key,
- * and "hold <ms> <key>..." keeps keys down together (game window only):
+ * "escape", "space", "up", "down", "left", "right", "shift", "ctrl", "tab", "alt", or any single letter or
+ * digit) delivers that key,
+ * and "hold <ms> <key>..." keeps keys down together (game window only); "pad <ms> <control>..." holds a
+ * virtual XInput controller's controls instead (see bench_input_pad):
  *
  *  - to the launcher window (class GameNxApp, wndproc 0x21ea670) as posted WM_KEYDOWN/WM_KEYUP; its
  *    window procedure acts on WM_KEYDOWN directly, without looking at focus;
@@ -22,6 +24,7 @@
 
 #include "vkd3d_private.h"
 
+#include <ctype.h>
 #include <stdio.h>
 
 #define BENCH_INPUT_FILE "Z:\\run\\user\\1000\\vkd3d-input"
@@ -94,6 +97,162 @@ static UINT WINAPI bench_get_raw_input_data(HRAWINPUT handle, UINT command, void
     }
     memcpy(data, &ri, n);
     return n;
+}
+
+/* Virtual XInput controller, user index 0. The game loads XInput at run time (XInput1_4, 1_3 or
+ * 9_1_0, through GetProcAddress), so the loaded DLL's XInputGetState and XInputGetCapabilities are
+ * overwritten with a jump to these on the first "pad" command. Bench processes only (cfgrun.sh sets
+ * VKD3D_BENCH_INPUT); no real controller is passed through. */
+struct bench_xinput_gamepad
+{
+    WORD buttons;
+    BYTE left_trigger, right_trigger;
+    SHORT thumb_lx, thumb_ly, thumb_rx, thumb_ry;
+};
+
+struct bench_xinput_state
+{
+    DWORD packet;
+    struct bench_xinput_gamepad pad;
+};
+
+struct bench_xinput_capabilities
+{
+    BYTE type, sub_type;
+    WORD flags;
+    struct bench_xinput_gamepad pad;
+    WORD left_motor, right_motor;
+};
+
+static struct
+{
+    struct bench_xinput_state state;
+    bool patched;
+    LONG calls;
+} bench_pad;
+
+static DWORD WINAPI bench_xinput_get_state(DWORD user, struct bench_xinput_state *state)
+{
+    InterlockedIncrement(&bench_pad.calls);
+    if (user)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    *state = bench_pad.state;
+    return ERROR_SUCCESS;
+}
+
+static DWORD WINAPI bench_xinput_get_capabilities(DWORD user, DWORD flags, struct bench_xinput_capabilities *caps)
+{
+    if (user)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    memset(caps, 0, sizeof(*caps));
+    caps->type = 1; /* XINPUT_DEVTYPE_GAMEPAD */
+    caps->sub_type = 1; /* XINPUT_DEVSUBTYPE_GAMEPAD */
+    caps->pad.buttons = 0xf3ff;
+    caps->pad.left_trigger = caps->pad.right_trigger = 0xff;
+    caps->pad.thumb_lx = caps->pad.thumb_ly = caps->pad.thumb_rx = caps->pad.thumb_ry = (SHORT)0xffc0;
+    caps->left_motor = caps->right_motor = 0xff;
+    return ERROR_SUCCESS;
+}
+
+/* mov rax, imm64; jmp rax */
+static void bench_input_patch_function(uint8_t *code, void *target)
+{
+    uint8_t jump[12] = {0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe0};
+    DWORD old_protect;
+
+    memcpy(jump + 2, &target, sizeof(target));
+    VirtualProtect(code, sizeof(jump), PAGE_EXECUTE_READWRITE, &old_protect);
+    memcpy(code, jump, sizeof(jump));
+    VirtualProtect(code, sizeof(jump), old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(jump));
+}
+
+static unsigned int bench_input_patch_xinput(void)
+{
+    static const char *dlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
+    unsigned int i, patched = 0;
+    HMODULE module;
+    void *f;
+
+    for (i = 0; i < ARRAY_SIZE(dlls); i++)
+    {
+        if (!(module = GetModuleHandleA(dlls[i])))
+            continue;
+        if ((f = (void *)GetProcAddress(module, "XInputGetState")))
+        {
+            bench_input_patch_function(f, (void *)bench_xinput_get_state);
+            patched++;
+        }
+        /* Ordinal 100, XInputGetStateEx (the same state plus the guide button), where exported. */
+        if ((f = (void *)GetProcAddress(module, (const char *)(uintptr_t)100)))
+            bench_input_patch_function(f, (void *)bench_xinput_get_state);
+        if ((f = (void *)GetProcAddress(module, "XInputGetCapabilities")))
+            bench_input_patch_function(f, (void *)bench_xinput_get_capabilities);
+        INFO("bench input: %s patched to the virtual controller.\n", dlls[i]);
+    }
+    return patched;
+}
+
+/* "pad <ms> <control>...": hold the virtual controller's controls for <ms>, then return it to rest
+ * (it stays connected). Controls: lx=, ly=, rx=, ry= (stick position -1..1; ly=1 is forward), lt, rt
+ * (fully pulled), and the buttons a b x y lb rb start back ls rs up down left right. */
+static void bench_input_pad(char *args, FILE *done)
+{
+    static const struct { const char *name; WORD bit; } buttons[] =
+    {
+        {"up", 0x0001}, {"down", 0x0002}, {"left", 0x0004}, {"right", 0x0008}, {"start", 0x0010},
+        {"back", 0x0020}, {"ls", 0x0040}, {"rs", 0x0080}, {"lb", 0x0100}, {"rb", 0x0200},
+        {"a", 0x1000}, {"b", 0x2000}, {"x", 0x4000}, {"y", 0x8000},
+    };
+    struct bench_xinput_gamepad pad = {0};
+    unsigned int i;
+    char *tok;
+    DWORD ms;
+
+    if (!bench_pad.patched)
+    {
+        if (!bench_input_patch_xinput())
+        {
+            fprintf(done, "none pad (no XInput DLL loaded)\n");
+            return;
+        }
+        bench_pad.patched = true;
+    }
+
+    ms = strtoul(args, &args, 10);
+    while ((tok = strtok(args, " ")))
+    {
+        args = NULL;
+        if (strchr(tok, '='))
+        {
+            SHORT v = (SHORT)max(-32767.0, min(32767.0, atof(strchr(tok, '=') + 1) * 32767.0));
+            if (!strncmp(tok, "lx=", 3)) pad.thumb_lx = v;
+            else if (!strncmp(tok, "ly=", 3)) pad.thumb_ly = v;
+            else if (!strncmp(tok, "rx=", 3)) pad.thumb_rx = v;
+            else if (!strncmp(tok, "ry=", 3)) pad.thumb_ry = v;
+            else goto unknown;
+            continue;
+        }
+        if (!strcmp(tok, "lt")) { pad.left_trigger = 0xff; continue; }
+        if (!strcmp(tok, "rt")) { pad.right_trigger = 0xff; continue; }
+        for (i = 0; i < ARRAY_SIZE(buttons); i++)
+            if (!strcmp(tok, buttons[i].name))
+                break;
+        if (i == ARRAY_SIZE(buttons))
+            goto unknown;
+        pad.buttons |= buttons[i].bit;
+    }
+
+    bench_pad.state.pad = pad;
+    bench_pad.state.packet++;
+    Sleep(ms);
+    memset(&bench_pad.state.pad, 0, sizeof(bench_pad.state.pad));
+    bench_pad.state.packet++;
+    fprintf(done, "pad %lu ms, %ld XInputGetState calls so far\n", (unsigned long)ms, (long)bench_pad.calls);
+    return;
+
+unknown:
+    fprintf(done, "unknown pad control %s\n", tok);
 }
 
 static bool bench_input_hook(void)
@@ -179,13 +338,16 @@ static UINT bench_input_vk(const char *name)
     {
         {"enter", VK_RETURN}, {"escape", VK_ESCAPE}, {"space", VK_SPACE},
         {"up", VK_UP}, {"down", VK_DOWN}, {"left", VK_LEFT}, {"right", VK_RIGHT},
-        {"w", 'W'}, {"a", 'A'}, {"s", 'S'}, {"d", 'D'}, {"shift", VK_SHIFT}, {"ctrl", VK_CONTROL},
+        {"shift", VK_SHIFT}, {"ctrl", VK_CONTROL}, {"tab", VK_TAB}, {"alt", VK_MENU},
     };
     unsigned int i;
 
     for (i = 0; i < ARRAY_SIZE(keys); i++)
         if (!strcmp(name, keys[i].name))
             return keys[i].vk;
+    /* Any single letter or digit: its virtual-key code is its uppercase character. */
+    if (name[0] && !name[1] && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= '0' && name[0] <= '9')))
+        return (UINT)toupper((unsigned char)name[0]);
     return 0;
 }
 
@@ -248,8 +410,8 @@ static void bench_input_hold(char *args, FILE *done)
 {
     struct bench_input_windows w = {.log = done};
     UINT vks[8], n = 0, i;
+    DWORD ms, end;
     char *tok;
-    DWORD ms;
 
     ms = strtoul(args, &args, 10);
     while (*args && n < ARRAY_SIZE(vks))
@@ -278,9 +440,10 @@ static void bench_input_hold(char *args, FILE *done)
         fprintf(done, "none hold\n");
         return;
     }
-    for (i = 0; i < n; i++)
-        bench_input.post_message(w.game, WM_INPUT, RIM_INPUT, (LPARAM)(uintptr_t)(BENCH_INPUT_MAGIC | vks[i] << 1));
-    Sleep(ms);
+    /* Key down, repeated every 30 ms while held, as a held key's autorepeat arrives. */
+    for (end = GetTickCount() + ms; (LONG)(end - GetTickCount()) > 0; Sleep(30))
+        for (i = 0; i < n; i++)
+            bench_input.post_message(w.game, WM_INPUT, RIM_INPUT, (LPARAM)(uintptr_t)(BENCH_INPUT_MAGIC | vks[i] << 1));
     for (i = 0; i < n; i++)
         bench_input.post_message(w.game, WM_INPUT, RIM_INPUT, (LPARAM)(uintptr_t)(BENCH_INPUT_MAGIC | vks[i] << 1 | 1));
     fprintf(done, "game hold %u keys %lu ms\n", n, (unsigned long)ms);
@@ -289,7 +452,7 @@ static void bench_input_hold(char *args, FILE *done)
 
 static DWORD WINAPI bench_input_thread(void *arg)
 {
-    char line[64];
+    char line[256];
     size_t len;
     FILE *f, *done;
 
@@ -308,6 +471,8 @@ static DWORD WINAPI bench_input_thread(void *arg)
             continue;
         if (!strncmp(line, "hold ", 5))
             bench_input_hold(line + 5, done);
+        else if (!strncmp(line, "pad ", 4))
+            bench_input_pad(line + 4, done);
         else
             bench_input_send(line, done);
         fclose(done);
