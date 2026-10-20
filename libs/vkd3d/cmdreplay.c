@@ -42,15 +42,19 @@ struct rp_chunk
 {
     struct rp_chunk *next;
     VkCommandBuffer vk_cb;
+    struct rp_pool *pool; /* of the command buffer, NULL for queued destroys */
     uint64_t seq;
-    uint32_t used, cap, ops, pad;
-    uint64_t pad2; /* data[] 16-byte aligned */
-    uint8_t data[];
+    uint32_t used, cap, ops;
+    bool executes; /* holds a vkCmdExecuteCommands (names secondaries of other pools) */
+    _Alignas(16) uint8_t data[];
 };
 
 struct rp_pool
 {
     VkCommandPool vk_pool;
+    uint64_t last_seq; /* last chunk published for one of its buffers */
+    bool secondaries;  /* has allocated secondary buffers (direct; a replayed vkCmdExecuteCommands may name them) */
+    bool direct;       /* its buffers record straight into the driver (feature REPLAY_OFF when it was last reset) */
     struct rp_cb *cbs;
     struct rp_pool *next;
 };
@@ -67,6 +71,9 @@ struct rp_cb
 #define RP_TAGGED(cb) ((uintptr_t)(cb) & 1)
 #define RP_CB(cb) ((struct rp_cb *)((uintptr_t)(cb) & ~(uintptr_t)1))
 #define RP_HANDLE(c) ((VkCommandBuffer)((uintptr_t)(c) | 1))
+/* Recorded into the stream: a tagged buffer of a pool that is not in direct mode. */
+#define RP_DEFER(cb) (RP_TAGGED(cb) && !RP_CB(cb)->pool->direct)
+#define RP_VK(cb) (RP_TAGGED(cb) ? RP_CB(cb)->vk_cb : (cb))
 
 #define RP_CHUNK_SIZE (64u << 10)
 #define RP_FREE_MAX 64 /* chunks kept for reuse */
@@ -87,6 +94,7 @@ static struct
     struct rp_chunk *head, *tail, *free;
     unsigned int free_count;
     uint64_t published; /* written under lock */
+    uint64_t exec_seq;  /* last chunk published with a vkCmdExecuteCommands */
     uint64_t done;      /* last chunk replayed */
     LONG waiters;
     bool sleeping;
@@ -118,7 +126,7 @@ static uint64_t rp_now_us(void)
     return (uint64_t)(t.QuadPart * 1000000.0 / f.QuadPart);
 }
 
-static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size, bool exact)
+static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, struct rp_pool *pool, uint32_t min_size, bool exact)
 {
     struct rp_chunk *k = NULL;
     uint32_t cap = exact ? min_size : max(RP_CHUNK_SIZE, min_size);
@@ -137,6 +145,8 @@ static struct rp_chunk *rp_chunk_get(VkCommandBuffer vk_cb, uint32_t min_size, b
         return NULL;
     k->next = NULL;
     k->vk_cb = vk_cb;
+    k->pool = pool;
+    k->executes = false;
     k->seq = 0;
     k->used = 0;
     k->cap = cap;
@@ -170,6 +180,10 @@ static uint64_t rp_publish_chunk(struct rp_chunk *k)
 
     pthread_mutex_lock(&rp.lock);
     seq = k->seq = rp.published + 1;
+    if (k->pool)
+        __atomic_store_n(&k->pool->last_seq, seq, __ATOMIC_RELEASE);
+    if (k->executes)
+        __atomic_store_n(&rp.exec_seq, seq, __ATOMIC_RELEASE);
     __atomic_store_n(&rp.published, seq, __ATOMIC_RELEASE);
     if (rp.tail)
         rp.tail->next = k;
@@ -210,7 +224,7 @@ static struct rp_chunk *rp_defer_chunk(void (*replay)(VkCommandBuffer, const str
     if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE))
         return NULL;
     size = align(size, 16);
-    if (!(k = rp_chunk_get(VK_NULL_HANDLE, size, true)))
+    if (!(k = rp_chunk_get(VK_NULL_HANDLE, NULL, size, true)))
         return NULL;
     op = (struct rp_op *)k->data;
     op->replay = replay;
@@ -256,10 +270,33 @@ done:
     __atomic_add_fetch(&rp.wait_us, rp_now_us() - start, __ATOMIC_RELAXED);
 }
 
+/* The worker has replayed everything published (a destroy then needs no queueing). */
+static bool rp_idle(void)
+{
+    return __atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE);
+}
+
 /* Everything published so far has been replayed. */
 static void rp_guard(void)
 {
     rp_wait(__atomic_load_n(&rp.published, __ATOMIC_ACQUIRE), &rp.guard_waits);
+}
+
+/* The same for a generated guard wrapper, counted by function (rp_guard_names). */
+static uint64_t rp_guard_counts[64], rp_guard_us[64];
+static __thread bool rp_render_thread;
+
+static void rp_guard_named(unsigned int index)
+{
+    uint64_t start, seq = __atomic_load_n(&rp.published, __ATOMIC_ACQUIRE);
+
+    if (__atomic_load_n(&rp.done, __ATOMIC_ACQUIRE) >= seq)
+        return;
+    start = rp_now_us();
+    rp_wait(seq, &rp.guard_waits);
+    index = min(index, 31u) + (rp_render_thread ? 32 : 0);
+    __atomic_add_fetch(&rp_guard_counts[index], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&rp_guard_us[index], rp_now_us() - start, __ATOMIC_RELAXED);
 }
 
 static void *rp_op_alloc(struct rp_cb *c, void (*replay)(VkCommandBuffer, const struct rp_op *), size_t size)
@@ -273,7 +310,7 @@ static void *rp_op_alloc(struct rp_cb *c, void (*replay)(VkCommandBuffer, const 
         rp_publish(c);
         k = NULL;
     }
-    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, size, false)))
+    if (!k && !(k = c->chunk = rp_chunk_get(c->vk_cb, c->pool, size, false)))
     {
         ERR("cmdreplay: out of memory.\n");
         abort();
@@ -286,11 +323,30 @@ static void *rp_op_alloc(struct rp_cb *c, void (*replay)(VkCommandBuffer, const 
     return op;
 }
 
+/* The worker is done with a pool: every chunk published for its buffers was replayed (the pool's
+ * other buffers being recorded hold their ops unpublished, so the worker is not touching them). */
+static void rp_pool_wait(struct rp_pool *pool)
+{
+    uint64_t seq = __atomic_load_n(&pool->last_seq, __ATOMIC_ACQUIRE);
+
+    if (pool->secondaries)
+        seq = max(seq, __atomic_load_n(&rp.exec_seq, __ATOMIC_ACQUIRE));
+    rp_wait(seq, &rp.pool_waits);
+}
+
 /* For a call made directly: the worker has replayed everything this buffer published before. */
+static uint64_t rp_drain_us;
+
 static VkCommandBuffer rp_drain_for_direct(struct rp_cb *c, unsigned int index)
 {
+    uint64_t start;
+
+    if (c->pool->direct)
+        return c->vk_cb;
+    start = rp_now_us();
     __atomic_add_fetch(&rp.drains[index], 1, __ATOMIC_RELAXED);
     rp_wait(rp_publish(c), &rp.pool_waits);
+    __atomic_add_fetch(&rp_drain_us, rp_now_us() - start, __ATOMIC_RELAXED);
     return c->vk_cb;
 }
 
@@ -407,8 +463,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkBeginCommandBuffer(VkCommandBuffer co
     struct rp_op_begin *op;
     struct rp_cb *c;
 
-    if (!RP_TAGGED(commandBuffer))
-        return rp_real.vkBeginCommandBuffer(commandBuffer, info);
+    if (!RP_DEFER(commandBuffer))
+        return rp_real.vkBeginCommandBuffer(RP_VK(commandBuffer), info);
     c = RP_CB(commandBuffer);
     if (info->pNext || info->pInheritanceInfo)
         return rp_real.vkBeginCommandBuffer(rp_drain_for_direct(c, RP_HAND_BEGIN), info);
@@ -430,8 +486,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkEndCommandBuffer(VkCommandBuffer comm
 {
     struct rp_cb *c;
 
-    if (!RP_TAGGED(commandBuffer))
-        return rp_real.vkEndCommandBuffer(commandBuffer);
+    if (!RP_DEFER(commandBuffer))
+        return rp_real.vkEndCommandBuffer(RP_VK(commandBuffer));
     c = RP_CB(commandBuffer);
     rp_op_alloc(c, rp_replay_end, sizeof(struct rp_op));
     c->end_seq = rp_publish(c);
@@ -447,7 +503,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetCommandBuffer(VkCommandBuffer co
         return rp_real.vkResetCommandBuffer(commandBuffer, flags);
     c = RP_CB(commandBuffer);
     rp_drop(c);
-    rp_wait(__atomic_load_n(&rp.published, __ATOMIC_ACQUIRE), &rp.pool_waits);
+    rp_pool_wait(c->pool);
     return rp_real.vkResetCommandBuffer(c->vk_cb, flags);
 }
 
@@ -474,6 +530,7 @@ void vkd3d_cmd_replay_register_pool(VkCommandPool vk_pool)
     if (!(pool = vkd3d_calloc(1, sizeof(*pool))))
         return;
     pool->vk_pool = vk_pool;
+    pool->direct = !!(vkd3d_bench_features() & VKD3D_BENCH_FEATURE_REPLAY_OFF);
     pthread_mutex_lock(&rp.pool_lock);
     pool->next = rp.pools;
     rp.pools = pool;
@@ -493,10 +550,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkAllocateCommandBuffers(VkDevice devic
     if (!(pool = rp_pool_find(info->commandPool)) || info->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
     {
         if (pool)
-            rp_guard();
+        {
+            pool->secondaries = true;
+            rp_pool_wait(pool);
+        }
         return rp_real.vkAllocateCommandBuffers(device, info, cbs);
     }
-    rp_guard();
+    rp_pool_wait(pool);
     if ((vr = rp_real.vkAllocateCommandBuffers(device, info, cbs)) < 0)
         return vr;
     for (i = 0; i < info->commandBufferCount; i++)
@@ -540,10 +600,14 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkFreeCommandBuffers(VkDevice device, VkCom
         uint32_t count, const VkCommandBuffer *cbs)
 {
     VkCommandBuffer stack[16], *real = stack;
+    struct rp_pool *pool;
     struct rp_cb *c;
     uint32_t i;
 
-    rp_guard();
+    if ((pool = rp_pool_find(vk_pool)))
+        rp_pool_wait(pool);
+    else
+        rp_wait(__atomic_load_n(&rp.exec_seq, __ATOMIC_ACQUIRE), &rp.pool_waits);
     if (count > ARRAY_SIZE(stack) && !(real = vkd3d_malloc(count * sizeof(*real))))
         return;
     for (i = 0; i < count; i++)
@@ -571,10 +635,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_vkResetCommandPool(VkDevice device, VkC
     struct rp_cb *c;
 
     if ((pool = rp_pool_find(vk_pool)))
+    {
         for (c = pool->cbs; c; c = c->pool_next)
             rp_drop(c);
-    /* Unregistered pools too: a replayed vkCmdExecuteCommands may name their secondaries. */
-    rp_guard();
+        rp_pool_wait(pool);
+        /* No buffer of the pool is recording or queued now: a safe point to change its mode. */
+        pool->direct = !!(vkd3d_bench_features() & VKD3D_BENCH_FEATURE_REPLAY_OFF);
+    }
+    else
+    {
+        /* An unregistered pool (particle secondaries): a vkCmdExecuteCommands not yet replayed may name them. */
+        rp_wait(__atomic_load_n(&rp.exec_seq, __ATOMIC_ACQUIRE), &rp.pool_waits);
+    }
     return rp_real.vkResetCommandPool(device, vk_pool, flags);
 }
 
@@ -598,8 +670,12 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkDestroyCommandPool(VkDevice device, VkCom
     {
         for (c = pool->cbs; c; c = c->pool_next)
             rp_drop(c);
+        rp_pool_wait(pool);
     }
-    rp_guard();
+    else
+    {
+        rp_wait(__atomic_load_n(&rp.exec_seq, __ATOMIC_ACQUIRE), &rp.pool_waits);
+    }
     rp_real.vkDestroyCommandPool(device, vk_pool, allocator);
     if (pool)
     {
@@ -714,9 +790,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPipelineBarrier2(VkCommandBuffer comma
     struct rp_cb *c;
     uint32_t i;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdPipelineBarrier2(commandBuffer, info);
+        rp_real.vkCmdPipelineBarrier2(RP_VK(commandBuffer), info);
         return;
     }
     c = RP_CB(commandBuffer);
@@ -768,9 +844,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBeginRendering(VkCommandBuffer command
     struct rp_cb *c;
     uint32_t i;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdBeginRendering(commandBuffer, info);
+        rp_real.vkCmdBeginRendering(RP_VK(commandBuffer), info);
         return;
     }
     c = RP_CB(commandBuffer);
@@ -822,9 +898,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushConstants(VkCommandBuffer commandB
 {
     struct rp_op_push_constants *op;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdPushConstants(commandBuffer, layout, stages, offset, size, values);
+        rp_real.vkCmdPushConstants(RP_VK(commandBuffer), layout, stages, offset, size, values);
         return;
     }
     op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_push_constants, sizeof(*op) + size);
@@ -867,8 +943,8 @@ static void rp_record_viewports(struct rp_cb *c, bool with_count, uint32_t first
 static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetViewport(VkCommandBuffer commandBuffer, uint32_t first,
         uint32_t count, const VkViewport *viewports)
 {
-    if (!RP_TAGGED(commandBuffer))
-        rp_real.vkCmdSetViewport(commandBuffer, first, count, viewports);
+    if (!RP_DEFER(commandBuffer))
+        rp_real.vkCmdSetViewport(RP_VK(commandBuffer), first, count, viewports);
     else
         rp_record_viewports(RP_CB(commandBuffer), false, first, count, viewports);
 }
@@ -876,8 +952,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetViewport(VkCommandBuffer commandBuf
 static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t count,
         const VkViewport *viewports)
 {
-    if (!RP_TAGGED(commandBuffer))
-        rp_real.vkCmdSetViewportWithCount(commandBuffer, count, viewports);
+    if (!RP_DEFER(commandBuffer))
+        rp_real.vkCmdSetViewportWithCount(RP_VK(commandBuffer), count, viewports);
     else
         rp_record_viewports(RP_CB(commandBuffer), true, 0, count, viewports);
 }
@@ -914,8 +990,8 @@ static void rp_record_scissors(struct rp_cb *c, bool with_count, uint32_t first,
 static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetScissor(VkCommandBuffer commandBuffer, uint32_t first,
         uint32_t count, const VkRect2D *rects)
 {
-    if (!RP_TAGGED(commandBuffer))
-        rp_real.vkCmdSetScissor(commandBuffer, first, count, rects);
+    if (!RP_DEFER(commandBuffer))
+        rp_real.vkCmdSetScissor(RP_VK(commandBuffer), first, count, rects);
     else
         rp_record_scissors(RP_CB(commandBuffer), false, first, count, rects);
 }
@@ -923,8 +999,8 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetScissor(VkCommandBuffer commandBuff
 static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t count,
         const VkRect2D *rects)
 {
-    if (!RP_TAGGED(commandBuffer))
-        rp_real.vkCmdSetScissorWithCount(commandBuffer, count, rects);
+    if (!RP_DEFER(commandBuffer))
+        rp_real.vkCmdSetScissorWithCount(RP_VK(commandBuffer), count, rects);
     else
         rp_record_scissors(RP_CB(commandBuffer), true, 0, count, rects);
 }
@@ -945,9 +1021,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetBlendConstants(VkCommandBuffer comm
 {
     struct rp_op_blend_constants *op;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdSetBlendConstants(commandBuffer, constants);
+        rp_real.vkCmdSetBlendConstants(RP_VK(commandBuffer), constants);
         return;
     }
     op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_blend_constants, sizeof(*op));
@@ -977,9 +1053,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDescriptorBufferOffsetsEXT(VkComman
 {
     struct rp_op_db_offsets *op;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdSetDescriptorBufferOffsetsEXT(commandBuffer, bind_point, layout, first_set, set_count,
+        rp_real.vkCmdSetDescriptorBufferOffsetsEXT(RP_VK(commandBuffer), bind_point, layout, first_set, set_count,
                 indices, offsets);
         return;
     }
@@ -1017,9 +1093,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindDescriptorBuffersEXT(VkCommandBuff
     struct rp_cb *c;
     uint32_t i;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdBindDescriptorBuffersEXT(commandBuffer, count, infos);
+        rp_real.vkCmdBindDescriptorBuffersEXT(RP_VK(commandBuffer), count, infos);
         return;
     }
     c = RP_CB(commandBuffer);
@@ -1068,9 +1144,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindVertexBuffers2(VkCommandBuffer com
     struct rp_op_vertex_buffers *op;
     VkDeviceSize *p;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdBindVertexBuffers2(commandBuffer, first, count, buffers, offsets, sizes, strides);
+        rp_real.vkCmdBindVertexBuffers2(RP_VK(commandBuffer), first, count, buffers, offsets, sizes, strides);
         return;
     }
     op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_vertex_buffers,
@@ -1110,9 +1186,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdBindDescriptorSets(VkCommandBuffer com
 {
     struct rp_op_descriptor_sets *op;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdBindDescriptorSets(commandBuffer, bind_point, layout, first_set, set_count, sets,
+        rp_real.vkCmdBindDescriptorSets(RP_VK(commandBuffer), bind_point, layout, first_set, set_count, sets,
                 dynamic_count, dynamic);
         return;
     }
@@ -1146,9 +1222,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdUpdateBuffer(VkCommandBuffer commandBu
 {
     struct rp_op_update_buffer *op;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdUpdateBuffer(commandBuffer, buffer, offset, size, data);
+        rp_real.vkCmdUpdateBuffer(RP_VK(commandBuffer), buffer, offset, size, data);
         return;
     }
     op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_update_buffer, sizeof(*op) + size);
@@ -1198,9 +1274,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_##fn(VkCommandBuffer commandBuffer, const i
     struct rp_cb *c; \
     uint32_t i; \
 \
-    if (!RP_TAGGED(commandBuffer)) \
+    if (!RP_DEFER(commandBuffer)) \
     { \
-        rp_real.fn(commandBuffer, info); \
+        rp_real.fn(RP_VK(commandBuffer), info); \
         return; \
     } \
     c = RP_CB(commandBuffer); \
@@ -1289,9 +1365,9 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
     struct rp_cb *c;
     uint32_t i;
 
-    if (!RP_TAGGED(commandBuffer))
+    if (!RP_DEFER(commandBuffer))
     {
-        rp_real.vkCmdPushDescriptorSetKHR(commandBuffer, bind_point, layout, set, count, writes);
+        rp_real.vkCmdPushDescriptorSetKHR(RP_VK(commandBuffer), bind_point, layout, set, count, writes);
         return;
     }
     c = RP_CB(commandBuffer);
@@ -1323,6 +1399,46 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
     }
 }
 
+struct rp_op_depth_bias
+{
+    struct rp_op h;
+    VkDepthBiasInfoEXT info;
+    VkDepthBiasRepresentationInfoEXT representation;
+};
+
+static void rp_replay_depth_bias(VkCommandBuffer cb, const struct rp_op *h)
+{
+    const struct rp_op_depth_bias *op = (const void *)h;
+    rp_real.vkCmdSetDepthBias2EXT(cb, &op->info);
+}
+
+static VKAPI_ATTR void VKAPI_CALL rp_vkCmdSetDepthBias2EXT(VkCommandBuffer commandBuffer, const VkDepthBiasInfoEXT *info)
+{
+    const VkDepthBiasRepresentationInfoEXT *representation = info->pNext;
+    struct rp_op_depth_bias *op;
+    struct rp_cb *c;
+
+    if (!RP_DEFER(commandBuffer))
+    {
+        rp_real.vkCmdSetDepthBias2EXT(RP_VK(commandBuffer), info);
+        return;
+    }
+    c = RP_CB(commandBuffer);
+    if (representation && (representation->sType != VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT ||
+            representation->pNext))
+    {
+        rp_real.vkCmdSetDepthBias2EXT(rp_drain_for_direct(c, RP_HAND_EXEC), info);
+        return;
+    }
+    op = rp_op_alloc(c, rp_replay_depth_bias, sizeof(*op));
+    op->info = *info;
+    if (representation)
+    {
+        op->representation = *representation;
+        op->info.pNext = &op->representation;
+    }
+}
+
 struct rp_op_execute
 {
     struct rp_op h;
@@ -1343,9 +1459,10 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdExecuteCommands(VkCommandBuffer comman
     struct rp_op_execute *op;
     uint32_t i;
 
-    if (RP_TAGGED(commandBuffer))
+    if (RP_DEFER(commandBuffer))
     {
         op = rp_op_alloc(RP_CB(commandBuffer), rp_replay_execute, sizeof(*op) + count * sizeof(*cbs));
+        RP_CB(commandBuffer)->chunk->executes = true;
         op->count = count;
         for (i = 0; i < count; i++)
             op->cbs[i] = RP_TAGGED(cbs[i]) ? RP_CB(cbs[i])->vk_cb : cbs[i];
@@ -1355,7 +1472,7 @@ static VKAPI_ATTR void VKAPI_CALL rp_vkCmdExecuteCommands(VkCommandBuffer comman
         return;
     for (i = 0; i < count; i++)
         real[i] = RP_TAGGED(cbs[i]) ? RP_CB(cbs[i])->vk_cb : cbs[i];
-    rp_real.vkCmdExecuteCommands(commandBuffer, count, real);
+    rp_real.vkCmdExecuteCommands(RP_VK(commandBuffer), count, real);
     if (real != stack)
         vkd3d_free(real);
 }
@@ -1395,7 +1512,10 @@ void vkd3d_cmd_replay_report(void)
     size_t len;
     unsigned int i;
 
-    if (!rp_state || (now = rp_now_us()) - last_us < 20000000)
+    if (!rp_state)
+        return;
+    rp_render_thread = true; /* presents come from the game's render thread */
+    if ((now = rp_now_us()) - last_us < 20000000)
         return;
     if (!last_us)
     {
@@ -1414,7 +1534,15 @@ void vkd3d_cmd_replay_report(void)
             len += snprintf(text + len, sizeof(text) - len, " %s %"PRIu64,
                     i < RP_DRAIN_COUNT ? rp_drain_names[i] : rp_hand_names[i - RP_DRAIN_COUNT], rp.drains[i]);
     }
-    INFO("%s.\n", text);
+    INFO("%s; drains %.1f ms.\n", text, rp_drain_us / 1000.0);
+    for (i = 0, len = 0; i < 64 && len < sizeof(text) - 64; i++)
+    {
+        if (rp_guard_counts[i] && (i & 31) < RP_GUARD_COUNT)
+            len += snprintf(text + len, sizeof(text) - len, " %s%s %"PRIu64" (%.1f ms)", i >= 32 ? "render:" : "",
+                    rp_guard_names[i & 31], rp_guard_counts[i], rp_guard_us[i] / 1000.0);
+    }
+    if (len)
+        INFO("cmdreplay guard waits:%s.\n", text);
     last_us = now;
     last_ops = ops;
     last_chunks = chunks;

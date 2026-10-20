@@ -7462,6 +7462,7 @@ void vkd3d_engine_present(void);
 #define VKD3D_BENCH_FEATURE_PDRAW_OFF 0x400u /* particle draws: constants copied the original way */
 #define VKD3D_BENCH_FEATURE_DISCARD_KEEP 0x100u /* DiscardResource on a render target: no UNDEFINED layout barrier */
 #define VKD3D_BENCH_FEATURE_DROPDST_OFF 0x800u /* dropdst patch: no resets of swapped copy destinations */
+#define VKD3D_BENCH_FEATURE_REPLAY_OFF 0x2000u /* cmdreplay: pools reset from now on record directly */
 #define VKD3D_BENCH_FEATURE_CLEAR_KEEP 0x1000u /* full clears of placed targets keep their layout when nothing else used the memory (command.c clear keep) */
 uint32_t vkd3d_bench_features(void);
 void vkd3d_bench_pinned_add(const void *ptr, uint64_t size);
